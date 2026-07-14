@@ -1,0 +1,5 @@
+{
+  "biz_days": [1, 2, 3, 4, 5],
+  "biz_start_hour": 9,
+  "biz_end_hour": 18
+}

@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token consumption pace</title>
+<style>
+ :root,:root[data-theme="dark"]{--bg:#0f1115;--fg:#cdd3dc;--mut:#8b93a1;
+   --tipbg:#1b1f27;--tipbd:#3a414e;--btnbd:#3a414e;--over:#e0894f;--under:#5fb87a;}
+ :root[data-theme="light"]{--bg:#ffffff;--fg:#1f2430;--mut:#5b636f;
+   --tipbg:#f4f5f7;--tipbd:#c2c8d0;--btnbd:#c2c8d0;--over:#c9731a;--under:#2f9e57;}
+ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+   font-family:system-ui,-apple-system,"Segoe UI",sans-serif;}
+ .wrap{display:flex;flex-direction:column;height:100%;box-sizing:border-box;padding:6px 8px;}
+ header{display:flex;justify-content:space-between;align-items:center;
+   font-size:12px;color:var(--mut);padding:2px 4px 4px;}
+ header .right{display:flex;align-items:center;gap:8px;}
+ #theme{background:transparent;border:1px solid var(--btnbd);color:var(--fg);
+   border-radius:4px;font-size:12px;line-height:1;padding:2px 7px;cursor:pointer;}
+ #theme:hover{background:var(--tipbg);}
+ .panel{flex:1;display:flex;flex-direction:column;min-height:0;}
+ .phead{position:absolute;top:10px;left:44px;z-index:3;pointer-events:none;
+   font-size:15px;font-variant-numeric:tabular-nums;white-space:nowrap;}
+ .phead .over{color:var(--over);} .phead .under{color:var(--under);} .phead .mut{color:var(--mut);}
+ .pcanvas{position:relative;flex:1;min-height:0;}
+ canvas{position:absolute;inset:0;width:100%;height:100%;display:block;}
+ .tip{position:absolute;pointer-events:none;background:var(--tipbg);border:1px solid var(--tipbd);
+   border-radius:4px;padding:4px 7px;font-size:11px;line-height:1.4;color:var(--fg);
+   white-space:nowrap;transform:translate(-50%,-115%);opacity:0;transition:opacity .08s;
+   font-variant-numeric:tabular-nums;z-index:5;}
+</style></head>
+<body><div class="wrap">
+ <header><span class="right"><span id="ts">loading…</span><button id="theme" title="テーマ切替">◐</button></span></header>
+ <div class="panel">
+   <div class="pcanvas"><canvas id="c0"></canvas><div class="phead" id="h0">…</div><div class="tip" id="t0"></div></div></div>
+ <div class="panel">
+   <div class="pcanvas"><canvas id="c1"></canvas><div class="phead" id="h1">…</div><div class="tip" id="t1"></div></div></div>
+</div>
+<script>
+(function(){
+ var POLL_MS=5000, TICK_MS=1000;
+ var COLORS={"5h":"#e15759","7d":"#4e79a7"};   // ブランド色は両テーマ共通
+ var THEMES={
+   dark: {grid:"#2a2f3a",axis:"#3a414e",label:"#7a828f",hover:"#99a3b3",dot:"#0f1115"},
+   light:{grid:"#e2e5ea",axis:"#c2c8d0",label:"#6b7480",hover:"#66707e",dot:"#ffffff"}
+ };
+ var ML=40, MR=8, MT=6, MB=18;
+ var data=null, lastGen=null, hover=[null,null], theme="dark";
+ function T(){ return THEMES[theme]||THEMES.dark; }
+
+ function pad(n){ return (n<10?"0":"")+n; }
+ function hm(d){ return pad(d.getHours())+":"+pad(d.getMinutes()); }
+ function md(d){ return pad(d.getMonth()+1)+"/"+pad(d.getDate()); }
+ function fmt(epoch, mode){
+   var d=new Date(epoch*1000);
+   return mode==="date" ? md(d)+" "+hm(d) : hm(d);
+ }
+ function xlab(epoch, mode){ var d=new Date(epoch*1000); return mode==="date"? md(d) : hm(d); }
+
+ function interp(arr, t){
+   if(!arr||!arr.length) return null;
+   if(t<=arr[0][0]) return arr[0][1];
+   if(t>=arr[arr.length-1][0]) return arr[arr.length-1][1];
+   for(var i=1;i<arr.length;i++){
+     if(t<=arr[i][0]){
+       var a=arr[i-1], b=arr[i], s=b[0]-a[0];
+       return s<=0 ? b[1] : a[1]+(b[1]-a[1])*(t-a[0])/s;
+     }
+   }
+   return arr[arr.length-1][1];
+ }
+ function nearest(arr, t){
+   if(!arr||!arr.length) return null;
+   var best=arr[0], bd=Math.abs(arr[0][0]-t);
+   for(var i=1;i<arr.length;i++){ var d=Math.abs(arr[i][0]-t); if(d<bd){bd=d;best=arr[i];} }
+   return best;
+ }
+ // 縦補助線の目盛り（ローカル時刻境界。setHours/setDate で DST も吸収）
+ function hourTicks(x0,x1){
+   var ticks=[], d=new Date(x0*1000); d.setMinutes(0,0,0);
+   if(d.getTime()/1000 < x0) d.setHours(d.getHours()+1);
+   while(d.getTime()/1000 <= x1){ ticks.push(d.getTime()/1000); d.setHours(d.getHours()+1); }
+   return ticks;
+ }
+ function dayTicks(x0,x1){
+   var ticks=[], d=new Date(x0*1000); d.setHours(0,0,0,0);
+   if(d.getTime()/1000 < x0) d.setDate(d.getDate()+1);
+   while(d.getTime()/1000 <= x1){ ticks.push(d.getTime()/1000); d.setDate(d.getDate()+1); }
+   return ticks;
+ }
+ // pace 乖離%（status line の dev と同一）: (used-even)/(100-even)*100。余地無しは null(="-")
+ function paceDev(u, e){
+   if(u===null || u===undefined) return null;
+   if(100-e <= 0) return null;
+   return (u-e)/(100-e)*100;
+ }
+ // pace(-100..0..+100)を色へ: -100=青 / 0=無彩色(灰) / +100=赤、中間は線形補間
+ var NEUTRAL="rgb(142,142,142)";
+ function lerp(a,b,f){ return Math.round(a+(b-a)*f); }
+ function colorForPace(pd){
+   if(pd===null || pd===undefined) return NEUTRAL;
+   var x = pd<-50?-50:(pd>50?50:pd);          // ±50% で飽和（外側は端点色のまま）
+   var BLUE=[24,110,255], GRAY=[142,142,142], RED=[225,80,80], a,b,f;
+   if(x<0){ a=BLUE; b=GRAY; f=(x+50)/50; } else { a=GRAY; b=RED; f=x/50; }
+   return "rgb("+lerp(a[0],b[0],f)+","+lerp(a[1],b[1],f)+","+lerp(a[2],b[2],f)+")";
+ }
+ // used の横グラデーション生成: 各点の pace を colFn で色化し停止点に。1点/幅0は色文字列を返す
+ function paceGradient(ctx, p, X, colFn, empty){
+   var u=p.used; if(!u || !u.length) return empty;
+   function colAt(i){
+     var ev=(p.even && p.even.length)?interp(p.even, u[i][0]):null;
+     return colFn(ev===null ? null : paceDev(u[i][1], ev));
+   }
+   var xa=X(u[0][0]), xb=X(u[u.length-1][0]);
+   if(!(xb>xa)) return colAt(u.length-1);
+   var g=ctx.createLinearGradient(xa,0,xb,0);
+   for(var i=0;i<u.length;i++){
+     var f=(X(u[i][0])-xa)/(xb-xa); f=f<0?0:(f>1?1:f);
+     g.addColorStop(f, colAt(i));
+   }
+   return g;
+ }
+
+ function setHeader(idx, p){
+   var h=document.getElementById("h"+idx);
+   if(p.used_now===null || p.used_now===undefined){
+     h.innerHTML=p.key+' <span class="mut">データ収集中…</span>';
+     return;
+   }
+   var pd=paceDev(p.used_now, p.std_now), paceStr;
+   if(pd===null){
+     paceStr='<span class="mut">pace -</span>';
+   } else {
+     var sign=pd>=0?"+":"-";
+     paceStr='<span style="color:'+colorForPace(pd)+'">pace '+sign+Math.round(Math.abs(pd))+'%</span>';
+   }
+   h.innerHTML=p.key+' used '+p.used_now.toFixed(0)+'%'
+     +' '+paceStr
+     +' <span class="mut">&rarr;reset '+p.reset_label+'</span>';
+ }
+
+ function draw(idx){
+   var cv=document.getElementById("c"+idx), ctx=cv.getContext("2d");
+   var dpr=window.devicePixelRatio||1, cssW=cv.clientWidth, cssH=cv.clientHeight;
+   if(cssW<2||cssH<2) return;
+   cv.width=Math.round(cssW*dpr); cv.height=Math.round(cssH*dpr);
+   ctx.setTransform(dpr,0,0,dpr,0,0);
+   ctx.clearRect(0,0,cssW,cssH);
+   var p=data&&data.panels[idx]; if(!p) return;
+
+   var pw=cssW-ML-MR, ph=cssH-MT-MB;
+   if(pw<10||ph<10) return;
+   var x0=p.x0, x1=p.x1;
+   function X(t){ return ML + (x1<=x0?0:(t-x0)/(x1-x0))*pw; }
+   function Y(v){ v=v<0?0:(v>100?100:v); return MT + (1-v/100)*ph; }
+
+   ctx.font="10px system-ui,sans-serif"; ctx.textBaseline="middle";
+   [0,20,40,60,80,100].forEach(function(g){          // パーセント軸: 20%単位
+     var y=Y(g);
+     ctx.strokeStyle=T().grid; ctx.lineWidth=1;
+     ctx.beginPath(); ctx.moveTo(ML,y+0.5); ctx.lineTo(ML+pw,y+0.5); ctx.stroke();
+     ctx.fillStyle=T().label; ctx.textAlign="right"; ctx.fillText(String(g), ML-5, y);
+   });
+   // 縦補助線 + X軸目盛り（同じ位置）: 5h=1時間ごと / 7d=1日ごと
+   var ticks = (p.xmode==="date" ? dayTicks(x0,x1) : hourTicks(x0,x1));
+   ctx.strokeStyle=T().grid; ctx.lineWidth=1;
+   ticks.forEach(function(t){
+     var gx=Math.round(X(t))+0.5;
+     ctx.beginPath(); ctx.moveTo(gx,MT); ctx.lineTo(gx,MT+ph); ctx.stroke();
+   });
+   ctx.strokeStyle=T().axis; ctx.lineWidth=1;
+   ctx.beginPath(); ctx.moveTo(ML,MT); ctx.lineTo(ML,MT+ph); ctx.lineTo(ML+pw,MT+ph); ctx.stroke();
+
+   ctx.fillStyle=T().label; ctx.textBaseline="alphabetic";
+   ticks.forEach(function(t){
+     var lx=X(t);
+     ctx.textAlign = lx<ML+18 ? "left" : (lx>ML+pw-18 ? "right" : "center");
+     ctx.fillText(xlab(t,p.xmode), lx, cssH-4);
+   });
+
+   if(p.even && p.even.length){
+     ctx.strokeStyle=T().label; ctx.globalAlpha=0.8; ctx.lineWidth=1.3; ctx.setLineDash([2,3]);
+     ctx.beginPath();
+     p.even.forEach(function(pt,i){ var xx=X(pt[0]),yy=Y(pt[1]); i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy); });
+     ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha=1;
+   }
+
+   if(p.used && p.used.length){
+     var grad=paceGradient(ctx, p, X, colorForPace, NEUTRAL);   // 青-灰-赤（無彩色を挟む・不透明）
+     ctx.beginPath(); ctx.moveTo(X(p.used[0][0]), Y(0));
+     p.used.forEach(function(pt){ ctx.lineTo(X(pt[0]), Y(pt[1])); });
+     ctx.lineTo(X(p.used[p.used.length-1][0]), Y(0)); ctx.closePath();
+     ctx.fillStyle=grad; ctx.globalAlpha=0.18; ctx.fill(); ctx.globalAlpha=1;   // フィルは一律18%
+     ctx.strokeStyle=grad; ctx.lineWidth=1.8; ctx.beginPath();
+     p.used.forEach(function(pt,i){ var xx=X(pt[0]),yy=Y(pt[1]); i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy); });
+     ctx.stroke();
+   }
+
+   var now=Date.now()/1000;
+   if(now>=x0 && now<=x1){
+     var xn=X(now);
+     ctx.strokeStyle="#888"; ctx.globalAlpha=0.7; ctx.lineWidth=1; ctx.setLineDash([3,3]);
+     ctx.beginPath(); ctx.moveTo(xn,MT); ctx.lineTo(xn,MT+ph); ctx.stroke();
+     ctx.setLineDash([]); ctx.globalAlpha=1;
+   }
+
+   var tip=document.getElementById("t"+idx), ht=hover[idx];
+   if(ht!==null && ht>=x0 && ht<=x1 && p.used && p.used.length){
+     var np=nearest(p.used, ht), ev=interp(p.even, np[0]);
+     var hx=X(np[0]), hy=Y(np[1]);
+     ctx.strokeStyle=T().hover; ctx.globalAlpha=0.5; ctx.lineWidth=1; ctx.setLineDash([2,2]);
+     ctx.beginPath(); ctx.moveTo(hx,MT); ctx.lineTo(hx,MT+ph); ctx.stroke();
+     ctx.setLineDash([]); ctx.globalAlpha=1;
+     ctx.fillStyle=colorForPace(ev===null ? null : paceDev(np[1], ev));
+     ctx.beginPath(); ctx.arc(hx,hy,3,0,Math.PI*2); ctx.fill();
+     ctx.strokeStyle=T().dot; ctx.lineWidth=1; ctx.stroke();
+     var s=fmt(np[0],p.xmode)+"<br>used <b>"+np[1].toFixed(1)+"%</b>";
+     if(ev!==null){
+       var pdv=paceDev(np[1], ev);
+       s+="<br>even "+ev.toFixed(1)+"%";
+       s+="<br>pace "+((pdv===null) ? "-" : (pdv>=0?"+":"-")+Math.abs(pdv).toFixed(1)+"%");
+     }
+     tip.innerHTML=s;
+     tip.style.left=hx+"px"; tip.style.top=Math.max(hy,MT+14)+"px"; tip.style.opacity=1;
+   } else { tip.style.opacity=0; }
+ }
+
+ function drawAll(){ draw(0); draw(1); }
+
+ function apply(j){
+   data=j;
+   for(var i=0;i<j.panels.length;i++) setHeader(i, j.panels[i]);
+   drawAll();
+   document.getElementById("ts").textContent="updated "+hm(new Date());
+ }
+
+ function poll(){
+   fetch("pace.json?t="+Date.now(), {cache:"no-store"})
+     .then(function(r){ if(!r.ok) throw 0; return r.json(); })
+     .then(function(j){ if(j.generated_at!==lastGen){ lastGen=j.generated_at; apply(j); } })
+     .catch(function(){ document.getElementById("ts").textContent="waiting for pace.json…"; });
+ }
+
+ function bindHover(idx){
+   var cv=document.getElementById("c"+idx);
+   cv.addEventListener("mousemove", function(e){
+     var p=data&&data.panels[idx]; if(!p) return;
+     var rect=cv.getBoundingClientRect(), mx=e.clientX-rect.left, pw=cv.clientWidth-ML-MR;
+     if(mx<ML || mx>ML+pw){ hover[idx]=null; draw(idx); return; }
+     hover[idx]=p.x0 + (mx-ML)/pw*(p.x1-p.x0); draw(idx);
+   });
+   cv.addEventListener("mouseleave", function(){ hover[idx]=null; draw(idx); });
+ }
+
+ function applyTheme(){
+   document.documentElement.setAttribute("data-theme", theme);
+   var b=document.getElementById("theme");
+   b.textContent = theme==="dark" ? "☀" : "☾";   // ☀ / ☾ = 切替後の基調
+   b.title = theme==="dark" ? "白基調へ" : "黒基調へ";
+   drawAll();
+ }
+ (function initTheme(){
+   var s=null; try{ s=localStorage.getItem("tp-theme"); }catch(e){}
+   if(s==="light"||s==="dark"){ theme=s; }
+   else if(window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches){ theme="light"; }
+   applyTheme();
+ })();
+ document.getElementById("theme").addEventListener("click", function(){
+   theme = theme==="dark" ? "light" : "dark";
+   try{ localStorage.setItem("tp-theme", theme); }catch(e){}
+   applyTheme();
+ });
+
+ bindHover(0); bindHover(1);
+ window.addEventListener("resize", drawAll);
+ poll(); setInterval(poll, POLL_MS); setInterval(drawAll, TICK_MS);
+})();
+</script>
+</body></html>

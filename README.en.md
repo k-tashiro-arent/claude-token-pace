@@ -1,0 +1,89 @@
+# claude-token-pace
+
+*[日本語](README.md) | English* ・ version **0.1.0** (SemVer)
+
+An interactive, browser-based viewer for your Claude Code **token consumption pace** (the 5-hour and 7-day rate-limit `used%`). It serves a small page over local HTTP and shows how far you are **ahead of or behind the even pace**, in both color and numbers.
+
+- **used line**: rate-limit usage (%). Colored by pace deviation: blue (behind) → gray (on pace) → red (ahead).
+- **even pace (dotted)**: the standard consumption pace. Linear for 5h, a business-hours staircase for 7d.
+- **now line**: current time (updated every second). Hover to read used / even / pace deviation at any point.
+
+Top panel = 5h window (the 5 hours until the next 5h reset), bottom panel = 7d window (the 7 days until the next 7d reset).
+
+## Requirements
+- **OS**: Linux / macOS / WSL2 (**native Windows is not supported**)
+- **Dependencies**: `python3`, `jq`, and a web browser
+- Rate-limit data is available for Claude.ai Pro / Max plans, and only after the first API response.
+
+## Install
+```bash
+git clone https://github.com/k-tashiro-arent/claude-token-pace.git
+cd claude-token-pace
+./install.sh
+```
+The installer:
+1. Places scripts/viewer under `~/.claude/token-pace/`
+2. Installs default `config.json` / `biz-hours.json` (existing files are kept)
+3. Adds the `/tpw` slash command to `~/.claude/commands/`
+4. **Wraps your statusLine** (backing up `settings.json`). The wrapper feeds the statusLine JSON to the sampler **while passing your existing statusLine output through unchanged**.
+
+> To install elsewhere: `TOKEN_PACE_DIR=/path/to/dir ./install.sh`
+
+## Update
+To update to the latest version, refresh the clone and re-run the installer:
+```bash
+cd claude-token-pace
+git pull            # or re-clone the latest
+./install.sh
+```
+`install.sh` is idempotent: it overwrites the program (`bin/`, `viewer.html`), keeps your settings (`config.json`, `biz-hours.json`), and leaves the statusLine untouched if it is already wrapped. On update it prints `vOLD → vNEW` (the installed version is recorded in `~/.claude/token-pace/.version`).
+
+## Usage
+In Claude Code:
+```
+/tpw
+```
+A local HTTP server (`127.0.0.1`) starts and the viewer opens in your default browser. Usage is recorded whenever the `statusLine` fires, and the viewer auto-refreshes every few seconds.
+
+## Configuration
+### Port (`~/.claude/token-pace/config.json`)
+```json
+{ "port": 8799 }
+```
+Resolution order: env `TOKEN_PACE_PORT` > `config.json` `port` > default `8799`. The preferred port is tried first; if busy, nearby ports are scanned automatically.
+
+### Business hours (`~/.claude/token-pace/biz-hours.json`)
+The basis for the 7d panel's even pace.
+```json
+{ "biz_days": [1, 2, 3, 4, 5], "biz_start_hour": 9, "biz_end_hour": 18 }
+```
+- `biz_days`: working days (1=Mon … 7=Sun)
+- `biz_start_hour` / `biz_end_hour`: working hours (JST, decimals allowed)
+
+## How it works
+```
+statusLine JSON ──(wrapper)──▶ your original statusLine output
+                    └─▶ sampler.sh ──▶ pace.jsonl (append, ~30s)
+                                          └─▶ pace-json.py ──▶ pace.json (~180s)
+/tpw ──▶ serve.sh ──▶ http.server(127.0.0.1) ──▶ viewer.html (Canvas)
+                                                   └─ polls pace.json; redraws when generated_at changes
+```
+- `pace.json` selects the target window by the **maximum observed `resets_at`**, so an old/idle session writing a stale `resets_at` will **not** make the display regress to the past.
+- No PNG/matplotlib: `pace.json` is generated with the Python standard library only, to keep dependencies light.
+
+## Data location
+`~/.claude/token-pace/` (`pace.jsonl` = records, `pace.json` = viewer input, `viewer.html`, config/state files). Bound to `127.0.0.1`, so it is never exposed to the LAN.
+
+## Uninstall
+```bash
+bash ~/.claude/token-pace/uninstall.sh
+```
+Restores your statusLine, removes the `/tpw` command, and stops the running server (recorded data is kept; remove it fully with `rm -rf ~/.claude/token-pace`).
+
+## Troubleshooting
+- **Browser doesn't open**: uses `xdg-open` (Linux), `open` (macOS), `powershell.exe` (WSL). If none exist, open the printed URL manually.
+- **Stuck on "collecting…"**: the `statusLine` hasn't fired yet, or rate-limit data isn't available. Wait a few minutes and confirm you're on Pro/Max and past the first API response.
+- **Port in use**: the preferred port plus nearby ports are scanned automatically. Pin it via `config.json` `port`.
+
+## License
+[MIT](LICENSE)
