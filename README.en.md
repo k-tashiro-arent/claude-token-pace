@@ -4,6 +4,8 @@
 
 An interactive, browser-based viewer for your Claude Code **token consumption pace** (the 5-hour and 7-day rate-limit `used%`). It serves a small page over local HTTP and shows how far you are **ahead of or behind the even pace**, in both color and numbers.
 
+![Token consumption pace viewer](docs/screenshot.png)
+
 - **used line**: rate-limit usage (%). Colored by pace deviation: blue (behind) → gray (on pace) → red (ahead).
 - **even pace (dotted)**: the standard consumption pace. Linear for 5h, a business-hours staircase for 7d.
 - **now line**: current time (updated every second). Hover to read used / even / pace deviation at any point.
