@@ -49,7 +49,7 @@ Either way, the installer:
   ./install.sh
   ```
 
-`install.sh` is idempotent: it overwrites the program (`bin/`, `viewer.html`), keeps your settings (`config.json`, `biz-hours.json`), and leaves the statusLine untouched if it is already wrapped. On update it prints `vOLD → vNEW` (the installed version is recorded in `~/.claude/token-pace/.version`).
+`install.sh` is idempotent: it overwrites the program (`bin/`, `index.html`), keeps your settings (`config.json`, `biz-hours.json`), and leaves the statusLine untouched if it is already wrapped. On update it prints `vOLD → vNEW` (the installed version is recorded in `~/.claude/token-pace/.version`).
 
 ## Usage
 In Claude Code:
@@ -74,7 +74,7 @@ The basis for the 7d panel's even pace.
 - `biz_start_hour` / `biz_end_hour`: working hours (JST, decimals allowed)
 
 ## Data location
-`~/.claude/token-pace/` (`pace.jsonl` = records, `pace.json` = viewer input, `viewer.html`, config/state files). Bound to `127.0.0.1`, so it is never exposed to the LAN.
+`~/.claude/token-pace/` (`pace.jsonl` = records, `pace.json` = viewer input, `index.html`, config/state files). Bound to `127.0.0.1`, so it is never exposed to the LAN.
 
 ## Uninstall
 ```bash

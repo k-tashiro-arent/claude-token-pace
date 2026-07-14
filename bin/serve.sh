@@ -16,10 +16,11 @@ TP_DIR="${TOKEN_PACE_DIR:-$HOME/.claude/token-pace}"
 BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GEN="$BIN_DIR/pace-json.py"
 STATE="$TP_DIR/.web_server"
-VIEWER="$TP_DIR/viewer.html"
+VIEWER="$TP_DIR/index.html"
 CONFIG="$TP_DIR/config.json"
 
 mkdir -p "$TP_DIR" 2>/dev/null
+rm -f "$TP_DIR/viewer.html" 2>/dev/null   # 旧名の残骸を掃除（/ で開くため index.html を配信）
 
 # 1) pace.json を最新化
 python3 "$GEN" 2>/dev/null || true
@@ -48,7 +49,7 @@ PORT=""
 if [[ -r $STATE ]]; then
   read -r spid sport < "$STATE" 2>/dev/null || true
   if [[ -n ${spid:-} && -n ${sport:-} ]] && kill -0 "$spid" 2>/dev/null \
-     && curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$sport/viewer.html"; then
+     && curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$sport/"; then
     PORT=$sport   # 既存サーバを再利用（URL 安定）
   fi
 fi
@@ -75,14 +76,14 @@ else:
   spid=$!
   disown 2>/dev/null || true
   for i in $(seq 1 30); do
-    curl -s -o /dev/null "http://127.0.0.1:$PORT/viewer.html" && break
+    curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break
     sleep 0.1
   done
   printf '%s %s\n' "$spid" "$PORT" > "$STATE"
 fi
 
 # 5) 既定ブラウザで開く（WSL/Windows -> powershell.exe, Linux -> xdg-open, macOS -> open）
-url="http://localhost:$PORT/viewer.html"
+url="http://localhost:$PORT/"
 if command -v powershell.exe >/dev/null 2>&1; then       # WSL / Windows
   powershell.exe -NoProfile -Command "Start-Process '$url'" >/dev/null 2>&1
 elif command -v xdg-open >/dev/null 2>&1; then           # Linux

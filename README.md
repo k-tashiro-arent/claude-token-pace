@@ -49,7 +49,7 @@ cd claude-token-pace
   ./install.sh
   ```
 
-`install.sh` は冪等です。プログラム（`bin/`・`viewer.html`）を上書きし、あなたの設定（`config.json`・`biz-hours.json`）は保持し、statusLine は既にラップ済みなら変更しません。更新時は `v旧 → v新` を表示します（インストール版数は `~/.claude/token-pace/.version` に記録）。
+`install.sh` は冪等です。プログラム（`bin/`・`index.html`）を上書きし、あなたの設定（`config.json`・`biz-hours.json`）は保持し、statusLine は既にラップ済みなら変更しません。更新時は `v旧 → v新` を表示します（インストール版数は `~/.claude/token-pace/.version` に記録）。
 
 ## 使い方
 Claude Code で:
@@ -74,7 +74,7 @@ Claude Code で:
 - `biz_start_hour` / `biz_end_hour`: 就業時刻（JST、小数可）
 
 ## データの場所
-`~/.claude/token-pace/`（`pace.jsonl` = 記録、`pace.json` = ビューア入力、`viewer.html`、各種設定・状態ファイル）。`127.0.0.1` バインドなので LAN には露出しません。
+`~/.claude/token-pace/`（`pace.jsonl` = 記録、`pace.json` = ビューア入力、`index.html`、各種設定・状態ファイル）。`127.0.0.1` バインドなので LAN には露出しません。
 
 ## アンインストール
 ```bash

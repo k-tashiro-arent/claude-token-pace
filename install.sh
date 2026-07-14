@@ -37,7 +37,8 @@ fi
 mkdir -p "$TP_DIR/bin" "$CMD_DIR"
 cp "$SRC/bin/pace-json.py" "$SRC/bin/serve.sh" "$SRC/bin/sampler.sh" "$TP_DIR/bin/"
 chmod +x "$TP_DIR/bin/serve.sh" "$TP_DIR/bin/sampler.sh" "$TP_DIR/bin/pace-json.py"
-cp "$SRC/web/viewer.html" "$TP_DIR/viewer.html"
+cp "$SRC/web/viewer.html" "$TP_DIR/index.html"   # / で開くため index.html として配信
+rm -f "$TP_DIR/viewer.html"                       # 旧名の残骸を掃除（アップグレード時）
 
 # 3) 既定設定（ユーザー設定は上書きしない）
 [[ -f "$TP_DIR/config.json"    ]] || cp "$SRC/defaults/config.json"    "$TP_DIR/config.json"
