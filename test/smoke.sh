@@ -13,6 +13,12 @@ SRV_PID=""
 TMPHOME=""
 TP_DIR=""
 
+# インストール経路: direct = install.sh 直叩き / bootstrap = curl ワンライナー経路
+# （bootstrap はローカル checkout 自身を clone させる。REF はブランチ/タグ名）
+MODE="${SMOKE_INSTALL_MODE:-direct}"
+BOOT_REPO="file://$REPO"
+BOOT_REF="${SMOKE_BOOTSTRAP_REF:-main}"
+
 # --- 隔離環境（最重要: 実 HOME を絶対に汚さない/消さない）---
 TMPHOME="$(mktemp -d 2>/dev/null || mktemp -d -t tokenpace)"
 if [ -z "$TMPHOME" ] || [ ! -d "$TMPHOME" ]; then echo "FATAL: mktemp -d failed"; exit 1; fi
@@ -37,6 +43,16 @@ WRAPPER="$TP_DIR/bin/statusline-wrapper.sh"
 fail() { echo "❌ FAIL: $*" >&2; exit 1; }
 ok()   { echo "✅ $*"; }
 
+# 選択された経路でインストールする（direct / bootstrap 共通のエントリ）。
+# stdout は抑止するが stderr は残す（失敗時にエラーを見えるように）。
+do_install() {
+  if [ "$MODE" = "bootstrap" ]; then
+    TOKEN_PACE_REPO="$BOOT_REPO" TOKEN_PACE_REF="$BOOT_REF" bash "$REPO/bootstrap.sh" >/dev/null
+  else
+    bash "$REPO/install.sh" >/dev/null
+  fi
+}
+
 # --- ブラウザ自動起動を無効化（powershell.exe/xdg-open/open を no-op に差し替え）---
 # serve.sh の起動カスケードが実ブラウザを開かないよう PATH 先頭にダミーを置く。
 mkdir -p "$HOME/.claude/commands" "$HOME/fakebin"
@@ -49,10 +65,14 @@ export PATH="$HOME/fakebin:$PATH"
 # 既存 statusLine を仕込む（ラッパーがこれを転送することを検証するため）
 jq -n '{statusLine:{type:"command",command:"echo ORIG-STATUSLINE-OK"}}' > "$SETTINGS"
 
-echo "== smoke: HOME=$HOME =="
+if [ "$MODE" = "bootstrap" ]; then
+  echo "== smoke: HOME=$HOME  mode=bootstrap  repo=$BOOT_REPO  ref=$BOOT_REF =="
+else
+  echo "== smoke: HOME=$HOME  mode=direct =="
+fi
 
-# 1) install
-bash "$REPO/install.sh" >/dev/null || fail "install.sh が非ゼロ終了"
+# 1) install（direct=install.sh / bootstrap=curl ワンライナー経路）
+do_install || fail "インストール($MODE) が非ゼロ終了"
 [ -x "$TP_DIR/bin/serve.sh" ]    || fail "serve.sh 未配置"
 [ -x "$TP_DIR/bin/sampler.sh" ]  || fail "sampler.sh 未配置"
 [ -x "$TP_DIR/bin/pace-json.py" ]|| fail "pace-json.py 未配置"
@@ -61,7 +81,7 @@ bash "$REPO/install.sh" >/dev/null || fail "install.sh が非ゼロ終了"
 got_wrap="$(jq -r '.statusLine.command' "$SETTINGS")"
 [ "$got_wrap" = "$WRAPPER" ] || fail "statusLine がラッパー化されていない (got: $got_wrap)"
 [ "$(cat "$TP_DIR/.orig_statusline")" = "echo ORIG-STATUSLINE-OK" ] || fail "元 statusLine が保存されていない"
-ok "install: ファイル配置・statusLine ラッパー化・元コマンド保存"
+ok "install($MODE): ファイル配置・statusLine ラッパー化・元コマンド保存"
 
 # 2) 実際の statusLine JSON（resets_at は now 相対にしてサンプルが窓内に入るようにする）
 now="$(date +%s)"
@@ -125,7 +145,7 @@ curl -s "http://127.0.0.1:$PORT/pace.json" | jq -e '.panels | length == 2' >/dev
 ok "serve.sh が / と /pace.json を配信 (port=$PORT pid=$SRV_PID)"
 
 # 7) 冪等性: 2 回目の install はラッパーを二重化せず、元コマンドも上書きしない
-bash "$REPO/install.sh" >/dev/null || fail "2 回目の install.sh が失敗"
+do_install || fail "2 回目のインストール($MODE) が失敗"
 [ "$(jq -r '.statusLine.command' "$SETTINGS")" = "$WRAPPER" ] || fail "冪等性: statusLine が変化した"
 [ "$(cat "$TP_DIR/.orig_statusline")" = "echo ORIG-STATUSLINE-OK" ] \
   || fail "冪等性: 元コマンドが上書きされた（転送ループの原因になる）"

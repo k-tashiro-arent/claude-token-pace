@@ -39,17 +39,22 @@ jobs:
           python -m pip install --quiet ruff
           ruff check bin/pace-json.py
 
-  # 1) インストール一気通貫スモークテスト / 2) ubuntu + macOS マトリクス
+  # 1) インストール一気通貫スモークテスト
+  # 2) ubuntu + macOS マトリクス、かつ install.sh 直叩き(direct) と
+  #    curl ワンライナー経路(bootstrap: ローカル checkout を clone) の両方
   smoke:
-    name: install smoke test
+    name: smoke (${{ matrix.os }} / ${{ matrix.mode }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        mode: [direct, bootstrap]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: ensure deps (jq / python3 / curl)
+        with:
+          fetch-depth: 0   # bootstrap がローカルリポジトリを clone するため浅くしない
+      - name: ensure deps (jq / python3 / curl / git)
         run: |
           if ! command -v jq >/dev/null 2>&1; then
             if [ "$RUNNER_OS" = "macOS" ]; then
@@ -60,6 +65,13 @@ jobs:
           fi
           echo "jq      : $(jq --version)"
           echo "python3 : $(python3 --version)"
+          echo "git     : $(git --version)"
           echo "bash    : $(bash --version | head -1)"
+      - name: prepare local ref for bootstrap
+        if: matrix.mode == 'bootstrap'
+        run: git branch -f citest HEAD   # テスト対象コミットを clone 可能なブランチ名で指す
       - name: run smoke test
+        env:
+          SMOKE_INSTALL_MODE: ${{ matrix.mode }}
+          SMOKE_BOOTSTRAP_REF: citest
         run: bash test/smoke.sh
