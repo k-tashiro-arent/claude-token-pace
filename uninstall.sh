@@ -37,7 +37,7 @@ fi
 
 # 3) サーバ停止
 if [[ -r "$TP_DIR/.web_server" ]]; then
-  read -r spid sport < "$TP_DIR/.web_server" 2>/dev/null || true
+  read -r spid _ < "$TP_DIR/.web_server" 2>/dev/null || true
   if [[ -n "${spid:-}" ]] && kill "$spid" 2>/dev/null; then
     echo "ローカルサーバ(PID $spid)を停止しました"
   fi

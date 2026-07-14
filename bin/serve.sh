@@ -75,7 +75,7 @@ else:
   fi
   spid=$!
   disown 2>/dev/null || true
-  for i in $(seq 1 30); do
+  for _ in $(seq 1 30); do
     curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break
     sleep 0.1
   done

@@ -1,0 +1,28 @@
+name: Release guard
+
+# 3) タグ push 時に VERSION ファイルとタグ名の一致を強制する。
+#    （v0.1.1 タグが VERSION=0.1.0 を指す、といった不整合を検出）
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  version-matches-tag:
+    name: VERSION must match tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: check VERSION == tag
+        run: |
+          ver="$(tr -d '[:space:]' < VERSION)"
+          echo "VERSION file : $ver"
+          echo "Git tag      : $GITHUB_REF_NAME"
+          if [ "v$ver" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::VERSION ($ver) がタグ ($GITHUB_REF_NAME) と一致しません。VERSION を更新するか付け直してください。"
+            exit 1
+          fi
+          echo "OK: v$ver == $GITHUB_REF_NAME"
