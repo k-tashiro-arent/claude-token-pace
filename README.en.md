@@ -15,7 +15,7 @@ Top panel = 5h window (the 5 hours until the next 5h reset), bottom panel = 7d w
 ## Requirements
 - **OS**: Linux / macOS / WSL2 (**native Windows is not supported**)
 - **Dependencies**: `python3`, `jq`, and a web browser
-- Rate-limit (5h/7d window) data is available on **Claude.ai subscription plans that have the 5-hour / 7-day usage limits (Pro / Max / Team, …)**, and only **after the first model response in a session** (before that the viewer shows "collecting…").
+- Rate-limit (5h/7d window) data is available on **Claude.ai subscription plans that have the 5-hour / 7-day usage limits (Pro / Max / Team, …)**, and only **once Claude Code has that data** (i.e. after your first model response; until then the viewer shows "collecting…").
 
 ## Install
 ### Option A: one-liner (curl → bash, recommended)
@@ -62,7 +62,8 @@ A local HTTP server (`127.0.0.1`) starts and the viewer opens in your default br
 
 ## Data collection & accumulation
 - Usage is recorded **automatically while you use Claude Code** (on each update of Claude Code's status line / `statusLine`). Sampling is throttled to about once per 30 s, and the graph (`pace.json`) is regenerated about every 3 minutes.
-- Recording begins only **after the first model response in a session**. Nothing is recorded before that or while idle, because usage does not change then (before the first response the viewer shows "collecting…").
+- Recording begins **once Claude Code has the rate-limit data** — i.e. after your first model response (until then the viewer shows "collecting…"); nothing is recorded while idle, because usage does not change then.
+- The 5h/7d limits are **per account (user), not per session**. With several concurrent sessions, each session's status line writes to the **same** `pace.jsonl`, so the recorded value is always your account-wide usage (more sessions just means more frequent sampling).
 - Data accumulates **locally, per installed environment** (`~/.claude/token-pace/pace.jsonl`). History is not shared across machines — each environment builds its own. Right after install there is no history, so the panels (especially the 7-day one) fill in as you keep using Claude Code.
 
 ## Configuration
@@ -91,7 +92,7 @@ Restores your statusLine, removes the `/tpw` command, and stops the running serv
 
 ## Troubleshooting
 - **Browser doesn't open**: uses `xdg-open` (Linux), `open` (macOS), `powershell.exe` (WSL). If none exist, open the printed URL manually.
-- **Stuck on "collecting…"**: recording hasn't started yet (no response in this session, or rate-limit data isn't available). Send a turn in Claude Code, wait a few minutes, and confirm your plan is supported (see Requirements).
+- **Stuck on "collecting…"**: recording hasn't started yet (Claude Code hasn't received a response yet, or rate-limit data isn't available). Send a turn in Claude Code, wait a few minutes, and confirm your plan is supported (see Requirements).
 - **Port in use**: the preferred port plus nearby ports are scanned automatically. Pin it via `config.json` `port`.
 
 ## License
