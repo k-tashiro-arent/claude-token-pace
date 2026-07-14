@@ -16,12 +16,23 @@ Top panel = 5h window (the 5 hours until the next 5h reset), bottom panel = 7d w
 - Rate-limit data is available for Claude.ai Pro / Max plans, and only after the first API response.
 
 ## Install
+### Option A: one-liner (curl → bash, recommended)
+```bash
+curl -fsSL https://raw.githubusercontent.com/k-tashiro-arent/claude-token-pace/main/bootstrap.sh | bash
+```
+It clones the repo into a temp dir and runs the installer (needs `git`, `python3`, `jq`). To pin a version:
+```bash
+curl -fsSL https://raw.githubusercontent.com/k-tashiro-arent/claude-token-pace/main/bootstrap.sh | TOKEN_PACE_REF=v0.1.0 bash
+```
+
+### Option B: git clone (if you want to update via `git pull`)
 ```bash
 git clone https://github.com/k-tashiro-arent/claude-token-pace.git
 cd claude-token-pace
 ./install.sh
 ```
-The installer:
+
+Either way, the installer:
 1. Places scripts/viewer under `~/.claude/token-pace/`
 2. Installs default `config.json` / `biz-hours.json` (existing files are kept)
 3. Adds the `/tpw` slash command to `~/.claude/commands/`
@@ -30,12 +41,14 @@ The installer:
 > To install elsewhere: `TOKEN_PACE_DIR=/path/to/dir ./install.sh`
 
 ## Update
-To update to the latest version, refresh the clone and re-run the installer:
-```bash
-cd claude-token-pace
-git pull            # or re-clone the latest
-./install.sh
-```
+- **curl method**: just re-run the same one-liner (it re-clones and re-installs each time).
+- **git clone method**: refresh the clone and re-run:
+  ```bash
+  cd claude-token-pace
+  git pull
+  ./install.sh
+  ```
+
 `install.sh` is idempotent: it overwrites the program (`bin/`, `viewer.html`), keeps your settings (`config.json`, `biz-hours.json`), and leaves the statusLine untouched if it is already wrapped. On update it prints `vOLD → vNEW` (the installed version is recorded in `~/.claude/token-pace/.version`).
 
 ## Usage
@@ -59,17 +72,6 @@ The basis for the 7d panel's even pace.
 ```
 - `biz_days`: working days (1=Mon … 7=Sun)
 - `biz_start_hour` / `biz_end_hour`: working hours (JST, decimals allowed)
-
-## How it works
-```
-statusLine JSON ──(wrapper)──▶ your original statusLine output
-                    └─▶ sampler.sh ──▶ pace.jsonl (append, ~30s)
-                                          └─▶ pace-json.py ──▶ pace.json (~180s)
-/tpw ──▶ serve.sh ──▶ http.server(127.0.0.1) ──▶ viewer.html (Canvas)
-                                                   └─ polls pace.json; redraws when generated_at changes
-```
-- `pace.json` selects the target window by the **maximum observed `resets_at`**, so an old/idle session writing a stale `resets_at` will **not** make the display regress to the past.
-- No PNG/matplotlib: `pace.json` is generated with the Python standard library only, to keep dependencies light.
 
 ## Data location
 `~/.claude/token-pace/` (`pace.jsonl` = records, `pace.json` = viewer input, `viewer.html`, config/state files). Bound to `127.0.0.1`, so it is never exposed to the LAN.
