@@ -35,8 +35,8 @@ fi
 
 # 2) ファイル配置
 mkdir -p "$TP_DIR/bin" "$CMD_DIR"
-cp "$SRC/bin/pace-json.py" "$SRC/bin/serve.sh" "$SRC/bin/sampler.sh" "$TP_DIR/bin/"
-chmod +x "$TP_DIR/bin/serve.sh" "$TP_DIR/bin/sampler.sh" "$TP_DIR/bin/pace-json.py"
+cp "$SRC/bin/pace-json.py" "$SRC/bin/serve.sh" "$SRC/bin/sampler.sh" "$SRC/bin/serve-http.py" "$TP_DIR/bin/"
+chmod +x "$TP_DIR/bin/serve.sh" "$TP_DIR/bin/sampler.sh" "$TP_DIR/bin/pace-json.py" "$TP_DIR/bin/serve-http.py"
 cp "$SRC/web/viewer.html" "$TP_DIR/index.html"   # / で開くため index.html として配信
 rm -f "$TP_DIR/viewer.html"                       # 旧名の残骸を掃除（アップグレード時）
 
@@ -119,7 +119,7 @@ elif [[ "$OLD_VER" != "$VERSION" ]]; then
 else
   echo "再インストール完了: v$VERSION"
 fi
-echo "次に statusLine が発火するたびに使用量が記録されます。"
+echo "以降、Claude Code を使うたびに使用量が記録されます。"
 echo "  ブラウザ表示   : Claude Code で /tpw"
 echo "  ポート変更     : $TP_DIR/config.json の \"port\"（または環境変数 TOKEN_PACE_PORT）"
 echo "  就業時間の設定 : $TP_DIR/biz-hours.json"

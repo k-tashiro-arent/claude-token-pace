@@ -76,6 +76,7 @@ do_install || fail "インストール($MODE) が非ゼロ終了"
 [ -x "$TP_DIR/bin/serve.sh" ]    || fail "serve.sh 未配置"
 [ -x "$TP_DIR/bin/sampler.sh" ]  || fail "sampler.sh 未配置"
 [ -x "$TP_DIR/bin/pace-json.py" ]|| fail "pace-json.py 未配置"
+[ -f "$TP_DIR/bin/serve-http.py" ]|| fail "serve-http.py 未配置"
 [ -f "$TP_DIR/index.html" ]      || fail "index.html 未配置"
 [ -f "$HOME/.claude/commands/tpw.md" ] || fail "/tpw コマンド未設置"
 got_wrap="$(jq -r '.statusLine.command' "$SETTINGS")"
@@ -143,6 +144,16 @@ pcode="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/pace.jso
 curl -s "http://127.0.0.1:$PORT/pace.json" | jq -e '.panels | length == 2' >/dev/null \
   || fail "配信された /pace.json が不正"
 ok "serve.sh が / と /pace.json を配信 (port=$PORT pid=$SRV_PID)"
+
+# 6b) ハードニング: 記録ファイル/元 statusLine は配信しない（ホワイトリスト外は 404）
+for badpath in /pace.jsonl /.orig_statusline /config.json; do
+  bc="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT$badpath")"
+  [ "$bc" = "404" ] || fail "非公開パス $badpath が配信された (HTTP $bc)"
+done
+# 6c) ハードニング: 別 Host（DNS リバインド）は 403 で拒否
+hc="$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example' "http://127.0.0.1:$PORT/pace.json")"
+[ "$hc" = "403" ] || fail "異なる Host を拒否しない (HTTP $hc)"
+ok "配信は index.html/pace.json に限定・別 Host を拒否（DNS リバインド対策）"
 
 # 7) 冪等性: 2 回目の install はラッパーを二重化せず、元コマンドも上書きしない
 do_install || fail "2 回目のインストール($MODE) が失敗"

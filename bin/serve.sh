@@ -2,11 +2,13 @@
 # トークン消費ペースをブラウザでインタラクティブ表示する（Linux / macOS / WSL）。
 # /tpw から呼ばれる。
 #
-# 仕組み: $TOKEN_PACE_DIR を 127.0.0.1 のローカル HTTP で配信し、Canvas 描画の
-#         viewer.html をブラウザで開く。viewer は pace.json を数秒ごとに fetch し、
+# 仕組み: index.html と pace.json だけを 127.0.0.1 のローカル HTTP で配信し（serve-http.py）、
+#         Canvas 描画の viewer をブラウザで開く。viewer は pace.json を数秒ごとに fetch し、
 #         generated_at の変化時だけ再描画（now 線は毎秒更新）。pace.json は
 #         バックグラウンド再生成で更新されるため自動反映される。
 #   ・127.0.0.1 バインド = LAN へは露出しない（ホストからのみ到達）
+#   ・配信は index.html/pace.json のホワイトリストのみ＋Host 検証（DNS リバインド対策）で、
+#     pace.jsonl や .orig_statusline は配信しない
 #   ・ブラウザは通常 localhost をプロキシ迂回するため社内プロキシ環境でも届く
 #
 # ポート解決: 環境変数 TOKEN_PACE_PORT > config.json の "port" > 既定 8799。
@@ -15,6 +17,7 @@ set -u
 TP_DIR="${TOKEN_PACE_DIR:-$HOME/.claude/token-pace}"
 BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GEN="$BIN_DIR/pace-json.py"
+SRVPY="$BIN_DIR/serve-http.py"
 STATE="$TP_DIR/.web_server"
 VIEWER="$TP_DIR/index.html"
 CONFIG="$TP_DIR/config.json"
@@ -69,9 +72,9 @@ else:
     print(pref)
 ' "$PORT_PREF")
   if command -v setsid >/dev/null 2>&1; then           # macOS には setsid が無いので nohup で代替
-    setsid python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$TP_DIR" >/dev/null 2>&1 </dev/null &
+    setsid python3 "$SRVPY" "$PORT" >/dev/null 2>&1 </dev/null &
   else
-    nohup  python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$TP_DIR" >/dev/null 2>&1 </dev/null &
+    nohup  python3 "$SRVPY" "$PORT" >/dev/null 2>&1 </dev/null &
   fi
   spid=$!
   disown 2>/dev/null || true

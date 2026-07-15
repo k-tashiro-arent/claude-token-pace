@@ -23,8 +23,13 @@ trap cleanup EXIT
 
 echo "claude-token-pace bootstrap: cloning $REPO_URL ($REF) ..."
 if ! git clone --quiet --depth 1 --branch "$REF" "$REPO_URL" "$tmp/repo" 2>/dev/null; then
-  # REF が見つからない等の場合は既定ブランチで clone
-  git clone --quiet --depth 1 "$REPO_URL" "$tmp/repo"
+  # REF がタグ/ブランチでない場合（コミット SHA 等）。--branch は SHA を受け付けないため
+  # 既定ブランチを full clone してから該当 REF を checkout する。checkout も失敗したら
+  # 「見つからない ref」なので、既定ブランチのまま続行することを明示的に警告する。
+  git clone --quiet "$REPO_URL" "$tmp/repo"
+  if ! git -C "$tmp/repo" checkout --quiet "$REF" 2>/dev/null; then
+    echo "WARNING: ref '$REF' が見つかりません。既定ブランチのまま install を続行します。" >&2
+  fi
 fi
 
 if [[ ! -f "$tmp/repo/install.sh" ]]; then

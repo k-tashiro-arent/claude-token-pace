@@ -5,3 +5,6 @@ __pycache__/
 # Editor / OS
 .DS_Store
 *.swp
+
+# Serena (ローカルのプロジェクト解析メタ。配布物ではない)
+.serena/
