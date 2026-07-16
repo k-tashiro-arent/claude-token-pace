@@ -27,6 +27,11 @@ BIZ_CONFIG = os.path.join(TP_DIR, "biz-hours.json")
 MAX_LINES = 20000      # ログ肥大時はこの行数までに prune
 KEEP_LINES = 12000     # prune 後に残す行数
 
+# 窓内リセット検出（稀に Anthropic 側が resets_at 据え置きのまま used% を下げる事象）。
+# 直近 RESET_WINDOW 件の最大値が現包絡より RESET_DROP pt を超えて低ければ包絡を張り直す。
+RESET_DROP = 5.0
+RESET_WINDOW = 5
+
 JST_OFFSET = 9 * 3600  # JST=UTC+9 固定(DST無)
 FIVE_HOUR = 5 * 3600
 SEVEN_DAY = 7 * 86400
@@ -110,11 +115,23 @@ def max_reset(rows, key):
     return best
 
 
-def running_max(seq):
-    """累積最大（単調非減少化）。"""
+def envelope(seq):
+    """used% の包絡線。基本は running-max（単調非減少化）で、複数セッションの遅延・
+    低値観測が線を下げるのを防ぐ。ただし「窓内リセット」（稀に Anthropic 側が resets_at
+    据え置きのまま used% を大きく下げる事象）を検出したら、その位置で包絡を張り直す。
+
+    リセット判定: 直近 RESET_WINDOW 件の最大値が現包絡 m より RESET_DROP pt を超えて
+    低い＝どのセッションももう高値を報告していない、とみなす。遅延した単発の低値(stale)は
+    直近に fresh な高値が残るため recent_max が下がらず、誤検出しない。
+    """
     out, m = [], None
-    for v in seq:
-        m = v if m is None else (v if v > m else m)
+    for i, v in enumerate(seq):
+        if m is None or v > m:
+            m = v
+        elif m - v > RESET_DROP and i + 1 >= RESET_WINDOW:
+            recent_max = max(seq[i - RESET_WINDOW + 1:i + 1])
+            if m - recent_max > RESET_DROP:
+                m = recent_max   # 窓内リセット → ここから包絡を張り直す
         out.append(m)
     return out
 
@@ -146,7 +163,7 @@ def window_series(rows, val_key, reset_key, target_reset, lo_epoch, hi_epoch):
     if not pts:
         return [], []
     xs = [datetime.fromtimestamp(t) for t, _ in pts]
-    ys = running_max([v for _, v in pts])
+    ys = envelope([v for _, v in pts])
     return xs, ys
 
 
