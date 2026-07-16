@@ -1,6 +1,6 @@
 # claude-token-pace
 
-*[日本語](README.md) | English* ・ version **0.1.3** (SemVer)
+*[日本語](README.md) | English* ・ version **0.1.4** (SemVer)
 
 An interactive, browser-based viewer for your Claude Code **token consumption pace** (the 5-hour and 7-day rate-limit `used%`). It serves a small page over local HTTP and shows how far you are **ahead of or behind the even pace**, in both color and numbers.
 

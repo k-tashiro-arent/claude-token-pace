@@ -137,9 +137,13 @@ def envelope(seq):
 
 
 def window_series(rows, val_key, reset_key, target_reset, lo_epoch, hi_epoch):
-    """対象窓の観測だけを取り出し、時刻昇順・running-max した (xs, ys) を返す。
+    """対象窓の観測だけを取り出し、時刻昇順・envelope した (xs, ys) を返す。
 
-    target_reset に一致する resets_at の観測のみ採用（別窓の遅延観測を除外）。
+    - target_reset に一致する resets_at の観測のみ採用（別窓の遅延観測を除外）。
+    - stale スナップショット除外: 新鮮な観測は必ず「5h リセット(h5r) が観測時点より未来」。
+      h5r <= ts の行は、セッション再開直後などに statusLine が出した過去の rate_limits
+      スナップショット（別=過去の 5h 窓の値）なので捨てる。7d 窓は 7 日長のため古い
+      スナップショットでも d7r が現窓と一致してしまい、これを弾かないとスパイクになる。
     """
     pts = []
     for r in rows:
@@ -152,6 +156,13 @@ def window_series(rows, val_key, reset_key, target_reset, lo_epoch, hi_epoch):
             continue
         if ts < lo_epoch or ts > hi_epoch:
             continue
+        h5r = r.get("h5r")   # 最速リセット。stale 判定に使う（両パネル共通）
+        if h5r is not None:
+            try:
+                if float(h5r) <= ts:
+                    continue   # 観測時点で既に過ぎた 5h リセット = 古いスナップショット
+            except (ValueError, TypeError):
+                pass
         if target_reset is not None and rk is not None:
             try:
                 if float(rk) != target_reset:

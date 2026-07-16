@@ -156,6 +156,37 @@ jq -e '.panels[0].used_now == 80' "$RDIR/pace.json" >/dev/null \
   || fail "reset回帰: 5h(リセット無し)が想定外（used_now=$u5, 期待80）"
 ok "窓内リセット検出: 7d 包絡を張り直し (used_now=$u7) / 5h は不変 ($u5)"
 
+# 5s) stale スナップショット回帰: 5h リセット(h5r)が観測時点で過去の行は古い rate_limits
+#     スナップショット。7d 窓は長く d7r が現窓と一致してしまうため、除外しないと高い
+#     stale 値(下記 d7=40)がスパイクになる。h5r<=ts の行が捨てられ 7d が跳ねないことを検証。
+SDIR="$HOME/stale-test"
+mkdir -p "$SDIR"
+python3 - "$SDIR/pace.jsonl" <<'PY'
+import json, sys, time
+now = int(time.time())
+h5r_cur = now + 3600       # 新鮮な 5h 窓（未来）
+h5r_old = now - 7200       # stale: 2h 過去 → h5r <= ts
+d7r = now + 3 * 86400      # 現 7d 窓（stale 行も同じ現窓 d7r を持つ点がミソ）
+fresh_d7 = [5, 5, 6, 6, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8]
+fresh_h5 = [40, 42, 45, 48, 50, 52, 55, 58, 60, 62, 65, 68, 70, 72]
+n = len(fresh_d7)
+rows = [{"ts": now - (n - i) * 60, "h5": fresh_h5[i], "h5r": h5r_cur,
+         "d7": fresh_d7[i], "d7r": d7r, "sid": "fresh"} for i in range(n)]
+# 古いスナップショット: 高い d7=40 だが h5r は過去（＝別の古い 5h 窓）、d7r は現窓
+rows.append({"ts": now - (n // 2) * 60, "h5": 95, "h5r": h5r_old,
+             "d7": 40, "d7r": d7r, "sid": "stale"})
+rows.sort(key=lambda r: r["ts"])
+with open(sys.argv[1], "w") as f:
+    for r in rows:
+        f.write(json.dumps(r) + "\n")
+PY
+TOKEN_PACE_DIR="$SDIR" python3 "$TP_DIR/bin/pace-json.py" || fail "stale回帰: pace-json.py が非ゼロ終了"
+maxd7="$(jq -r '.panels[1].used | map(.[1]) | max' "$SDIR/pace.json")"
+un7="$(jq -r '.panels[1].used_now' "$SDIR/pace.json")"
+jq -e '(.panels[1].used | map(.[1]) | max) < 20 and .panels[1].used_now < 20' "$SDIR/pace.json" >/dev/null \
+  || fail "stale回帰: 古いスナップショット(d7=40)が除外されずスパイク (7d系列最大=$maxd7, used_now=$un7, 期待<20)"
+ok "stale スナップショット除外: h5r<=ts の古い行(d7=40)を弾き 7d はスパイクせず (系列最大=$maxd7)"
+
 # 6) serve.sh が / と /pace.json を配信
 bash "$TP_DIR/bin/serve.sh" >/dev/null || fail "serve.sh が非ゼロ終了"
 [ -r "$TP_DIR/.web_server" ] || fail ".web_server が記録されていない"
