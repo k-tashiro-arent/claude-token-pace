@@ -2,6 +2,10 @@
 
 *[日本語](README.md) | English* ・ version **0.1.4** (SemVer)
 
+[![CI](https://github.com/k-tashiro-arent/claude-token-pace/actions/workflows/ci.yml/badge.svg)](https://github.com/k-tashiro-arent/claude-token-pace/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/k-tashiro-arent/claude-token-pace)](https://github.com/k-tashiro-arent/claude-token-pace/releases)
+[![license: MIT](https://img.shields.io/github/license/k-tashiro-arent/claude-token-pace)](LICENSE)
+
 An interactive, browser-based viewer for your Claude Code **token consumption pace** (the 5-hour and 7-day rate-limit `used%`). It serves a small page over local HTTP and shows how far you are **ahead of or behind the even pace**, in both color and numbers.
 
 ![Token consumption pace viewer](docs/token-pace.gif)
@@ -11,6 +15,11 @@ An interactive, browser-based viewer for your Claude Code **token consumption pa
 - **now line**: current time (updated every second). Hover to read used / even / pace deviation at any point.
 
 Top panel = 5h window (the 5 hours until the next 5h reset), bottom panel = 7d window (the 7 days until the next 7d reset).
+
+## Why
+- **Runs on your existing Claude subscription** — no API key, no extra cost. It just reads the rate-limit data Claude Code already has.
+- **Business-hours-aware pace** — the 7-day even pace follows your working hours (a staircase), not a flat line, so "am I burning too fast?" is actually meaningful.
+- **Local & private** — bound to `127.0.0.1` only; your usage data accumulates on your own machine and is never exposed to the LAN or anywhere else.
 
 ## Requirements
 - **OS**: Linux / macOS / WSL2 (**native Windows is not supported**)
