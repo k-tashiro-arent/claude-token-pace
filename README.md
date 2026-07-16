@@ -1,6 +1,6 @@
 # claude-token-pace
 
-*日本語 | [English](README.en.md)* ・ バージョン **0.1.2**（SemVer）
+*日本語 | [English](README.en.md)* ・ バージョン **0.1.3**（SemVer）
 
 Claude Code の**トークン消費ペース**（5時間枠・7日枠のレート制限 used%）を、ブラウザでインタラクティブに表示するツールです。ローカル HTTP で配信し、**標準ペース（even pace）との乖離**を色と数値で確認できます。
 

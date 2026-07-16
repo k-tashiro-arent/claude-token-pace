@@ -127,6 +127,35 @@ jq -e '.panels | all(has("used"))' "$TP_DIR/pace.json" >/dev/null || fail "panel
 jq -e 'has("generated_at")'     "$TP_DIR/pace.json" >/dev/null || fail "pace.json に generated_at が無い"
 ok "pace-json.py が妥当な pace.json を生成 (panels=2)"
 
+# 5r) 窓内リセット回帰: resets_at 据え置きで used% が急落したら包絡を張り直す
+#     （旧 running_max のままだと 7d がピーク60に張り付いて used_now<20 を満たさず失敗する）
+#     install/serve フローに干渉しないよう別ディレクトリで pace-json.py を実行。
+RDIR="$HOME/reset-test"
+mkdir -p "$RDIR"
+python3 - "$RDIR/pace.jsonl" <<'PY'
+import json, sys, time
+now = int(time.time())
+h5r = now + 3600           # 5h 窓（now 相対）
+d7r = now + 3 * 86400      # 7d 窓（リセットが起きても resets_at は据え置き＝同一値）
+# 5h: 単調上昇（リセット無し）。 7d: 60 まで上昇 → 3 へ急落 → stale 高値60混入 → 再上昇。
+h5 = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80]
+d7 = [10, 20, 30, 40, 50, 60, 60, 60, 3, 60, 4, 5, 6, 7, 8, 9]
+n = len(d7)
+with open(sys.argv[1], "w") as f:
+    for i in range(n):
+        ts = now - (n - 1 - i) * 60   # 昇順・全て窓内
+        f.write(json.dumps({"ts": ts, "h5": h5[i], "h5r": h5r,
+                            "d7": d7[i], "d7r": d7r, "sid": "reset-test"}) + "\n")
+PY
+TOKEN_PACE_DIR="$RDIR" python3 "$TP_DIR/bin/pace-json.py" || fail "reset回帰: pace-json.py が非ゼロ終了"
+u7="$(jq -r '.panels[1].used_now' "$RDIR/pace.json")"
+u5="$(jq -r '.panels[0].used_now' "$RDIR/pace.json")"
+jq -e '.panels[1].used_now != null and .panels[1].used_now < 20' "$RDIR/pace.json" >/dev/null \
+  || fail "reset回帰: 7d がピークに張り付き（used_now=$u7, 期待<20＝リセット未検出）"
+jq -e '.panels[0].used_now == 80' "$RDIR/pace.json" >/dev/null \
+  || fail "reset回帰: 5h(リセット無し)が想定外（used_now=$u5, 期待80）"
+ok "窓内リセット検出: 7d 包絡を張り直し (used_now=$u7) / 5h は不変 ($u5)"
+
 # 6) serve.sh が / と /pace.json を配信
 bash "$TP_DIR/bin/serve.sh" >/dev/null || fail "serve.sh が非ゼロ終了"
 [ -r "$TP_DIR/.web_server" ] || fail ".web_server が記録されていない"
