@@ -1,6 +1,6 @@
 # claude-token-pace
 
-*[日本語](README.md) | English* ・ version **0.1.4** (SemVer)
+*[日本語](README.md) | English* ・ version **0.1.5** (SemVer)
 
 [![CI](https://github.com/k-tashiro-arent/claude-token-pace/actions/workflows/ci.yml/badge.svg)](https://github.com/k-tashiro-arent/claude-token-pace/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/k-tashiro-arent/claude-token-pace)](https://github.com/k-tashiro-arent/claude-token-pace/releases)
