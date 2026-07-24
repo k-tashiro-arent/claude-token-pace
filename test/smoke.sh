@@ -187,6 +187,83 @@ jq -e '(.panels[1].used | map(.[1]) | max) < 20 and .panels[1].used_now < 20' "$
   || fail "stale回帰: 古いスナップショット(d7=40)が除外されずスパイク (7d系列最大=$maxd7, used_now=$un7, 期待<20)"
 ok "stale スナップショット除外: h5r<=ts の古い行(d7=40)を弾き 7d はスパイクせず (系列最大=$maxd7)"
 
+# 5p) プレイバック回帰(5h): 直近7dに重なる 5h 窓が seg5h として並び、窓の切替＝リセットが再現される。
+#     連続する 2 つの 5h 窓（前窓 h5 が 90 まで上昇 → 現窓は 5 から再上昇）を用意し、
+#     seg5h が古い順に 2 セグメント／後段セグメントが低値から始まる（リセット再現）ことを検証。
+PDIR="$HOME/playback-test"
+mkdir -p "$PDIR"
+python3 - "$PDIR/pace.jsonl" <<'PY'
+import json, sys, time
+now = int(time.time())
+h5r_a = now - 3600            # 前の 5h 窓（1h 前にリセット済）: 窓=[now-6h, now-1h]
+h5r_b = h5r_a + 5 * 3600      # 現在の 5h 窓（now+4h にリセット）: 窓=[now-1h, now+4h]
+d7r = now + 3 * 86400
+rows = []
+# 前窓 A: ts=now-6h..now-2h（全て h5r_a より過去＝新鮮）、h5 は 10→90
+for i, h5 in enumerate([10, 30, 50, 70, 90]):
+    rows.append({"ts": now - 6 * 3600 + i * 3600, "h5": h5, "h5r": h5r_a,
+                 "d7": 20 + i, "d7r": d7r, "sid": "winA"})
+# 現窓 B: ts=now-45m..now、h5 は 5→45（リセット後に低値から再上昇）
+for i, h5 in enumerate([5, 15, 30, 45]):
+    rows.append({"ts": now - 2700 + i * 900, "h5": h5, "h5r": h5r_b,
+                 "d7": 26 + i, "d7r": d7r, "sid": "winB"})
+with open(sys.argv[1], "w") as f:
+    for r in rows:
+        f.write(json.dumps(r) + "\n")
+PY
+TOKEN_PACE_DIR="$PDIR" python3 "$TP_DIR/bin/pace-json.py" || fail "playback回帰: pace-json.py が非ゼロ終了"
+jq -e 'has("playback") and (.playback | has("start") and has("now") and has("seg5h"))' "$PDIR/pace.json" >/dev/null \
+  || fail "playback回帰: playback(start/now/seg5h) が無い"
+jq -e '.playback.seg5h | length == 2' "$PDIR/pace.json" >/dev/null \
+  || fail "playback回帰: seg5h が 2 セグメントでない (len=$(jq -r '.playback.seg5h|length' "$PDIR/pace.json"))"
+jq -e '.playback.seg5h | all(has("x0") and has("x1") and has("even") and has("used") and has("reset_label") and (.xmode=="time"))' \
+  "$PDIR/pace.json" >/dev/null || fail "playback回帰: 5h seg に必須キー欠落 or xmode!=time"
+jq -e '(.playback.seg7d | length >= 1) and (.playback.seg7d | all(has("x0") and has("x1") and has("even") and has("used") and (.xmode=="date")))' \
+  "$PDIR/pace.json" >/dev/null || fail "playback回帰: seg7d が無い or 必須キー欠落 or xmode!=date"
+segmax="$(jq -r '.playback.seg5h[0].used | map(.[1]) | max' "$PDIR/pace.json")"
+segb0="$(jq -r '.playback.seg5h[1].used[0][1]' "$PDIR/pace.json")"
+jq -e '(.playback.seg5h[0].used | map(.[1]) | max) >= 80' "$PDIR/pace.json" >/dev/null \
+  || fail "playback回帰: 前窓が高値に達していない (max=$segmax, 期待>=80)"
+jq -e '.playback.seg5h[1].used[0][1] <= 20' "$PDIR/pace.json" >/dev/null \
+  || fail "playback回帰: 現窓が低値から始まらない＝リセット未再現 (先頭=$segb0, 期待<=20)"
+ok "プレイバック(5h): seg5h=2窓・前窓ピーク($segmax)→現窓は低値開始($segb0)でリセット再現"
+
+# 5q) プレイバック回帰(7d): 直近7dに 7d 窓の境界をまたぐと seg7d が古い順に 2 セグメントになり、
+#     後段（現 7d 窓）が低値から始まる＝7d リセットが再現される。h5r は各行 ts より未来にして
+#     stale フィルタを通す（そうしないと window_series が全行を捨てる）。
+QDIR="$HOME/playback7d-test"
+mkdir -p "$QDIR"
+python3 - "$QDIR/pace.jsonl" <<'PY'
+import json, sys, time
+now = int(time.time())
+d7r_a = now - 3600            # 前の 7d 窓（1h 前にリセット済）: 窓=[now-7d-1h, now-1h]
+d7r_b = d7r_a + 7 * 86400     # 現在の 7d 窓: 窓=[now-1h, now+7d-1h]
+rows = []
+# 前窓 A: ts を窓内に散らし d7 は 20→70 まで上昇。h5r=ts+1h（新鮮）
+for i, d7 in enumerate([20, 35, 50, 60, 70]):
+    ts = now - 6 * 86400 + i * 86400          # now-6d .. now-2d（全て d7r_a より過去）
+    rows.append({"ts": ts, "h5": 10 + i, "h5r": ts + 3600,
+                 "d7": d7, "d7r": d7r_a, "sid": "d7A"})
+# 現窓 B: ts=now-50m..now、d7 は 4→12（リセット後に低値から再上昇）
+for i, d7 in enumerate([4, 7, 10, 12]):
+    ts = now - 3000 + i * 900
+    rows.append({"ts": ts, "h5": 20 + i, "h5r": ts + 3600,
+                 "d7": d7, "d7r": d7r_b, "sid": "d7B"})
+with open(sys.argv[1], "w") as f:
+    for r in rows:
+        f.write(json.dumps(r) + "\n")
+PY
+TOKEN_PACE_DIR="$QDIR" python3 "$TP_DIR/bin/pace-json.py" || fail "playback7d回帰: pace-json.py が非ゼロ終了"
+jq -e '.playback.seg7d | length == 2' "$QDIR/pace.json" >/dev/null \
+  || fail "playback7d回帰: seg7d が 2 窓でない (len=$(jq -r '.playback.seg7d|length' "$QDIR/pace.json"))"
+q7max="$(jq -r '.playback.seg7d[0].used | map(.[1]) | max' "$QDIR/pace.json")"
+q7b0="$(jq -r '.playback.seg7d[1].used[0][1]' "$QDIR/pace.json")"
+jq -e '(.playback.seg7d[0].used | map(.[1]) | max) >= 60' "$QDIR/pace.json" >/dev/null \
+  || fail "playback7d回帰: 前 7d 窓が高値に達していない (max=$q7max, 期待>=60)"
+jq -e '.playback.seg7d[1].used[0][1] <= 20' "$QDIR/pace.json" >/dev/null \
+  || fail "playback7d回帰: 現 7d 窓が低値から始まらない＝リセット未再現 (先頭=$q7b0, 期待<=20)"
+ok "プレイバック(7d): seg7d=2窓・前窓ピーク($q7max)→現窓は低値開始($q7b0)で 7d リセット再現"
+
 # 6) serve.sh が / と /pace.json を配信
 bash "$TP_DIR/bin/serve.sh" >/dev/null || fail "serve.sh が非ゼロ終了"
 [ -r "$TP_DIR/.web_server" ] || fail ".web_server が記録されていない"

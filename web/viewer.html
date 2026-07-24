@@ -13,9 +13,11 @@
  header{display:flex;justify-content:space-between;align-items:center;
    font-size:12px;color:var(--mut);padding:2px 4px 4px;}
  header .right{display:flex;align-items:center;gap:8px;}
- #theme{background:transparent;border:1px solid var(--btnbd);color:var(--fg);
+ #theme,#play{background:transparent;border:1px solid var(--btnbd);color:var(--fg);
    border-radius:4px;font-size:12px;line-height:1;padding:2px 7px;cursor:pointer;}
- #theme:hover{background:var(--tipbg);}
+ #theme:hover,#play:hover{background:var(--tipbg);}
+ #play:disabled{opacity:.4;cursor:default;}
+ #play:disabled:hover{background:transparent;}
  .panel{flex:1;display:flex;flex-direction:column;min-height:0;}
  .phead{position:absolute;top:10px;left:44px;z-index:3;pointer-events:none;
    font-size:15px;font-variant-numeric:tabular-nums;white-space:nowrap;}
@@ -28,7 +30,7 @@
    font-variant-numeric:tabular-nums;z-index:5;}
 </style></head>
 <body><div class="wrap">
- <header><span class="right"><span id="ts">loading…</span><button id="theme" title="テーマ切替">◐</button></span></header>
+ <header><span class="right"><span id="ts">loading…</span><button id="play" title="直近7dを早送り再生" disabled>▶</button><button id="theme" title="テーマ切替">◐</button></span></header>
  <div class="panel">
    <div class="pcanvas"><canvas id="c0"></canvas><div class="phead" id="h0">…</div><div class="tip" id="t0"></div></div></div>
  <div class="panel">
@@ -44,6 +46,8 @@
  };
  var ML=40, MR=8, MT=6, MB=18;
  var data=null, lastGen=null, hover=[null,null], theme="dark";
+ var pb=null;                 // プレイバック中の状態 {t:仮想now(epoch秒), seg5h:[…], seg7d:[…], raf:id}
+ var PB_DURATION=6000;        // 早送り全体の所要(ms)
  function T(){ return THEMES[theme]||THEMES.dark; }
 
  function pad(n){ return (n<10?"0":"")+n; }
@@ -72,6 +76,27 @@
    var best=arr[0], bd=Math.abs(arr[0][0]-t);
    for(var i=1;i<arr.length;i++){ var d=Math.abs(arr[i][0]-t); if(d<bd){bd=d;best=arr[i];} }
    return best;
+ }
+ // used を時刻 T までに切り詰め、末尾に補間点を足して線を T までピッタリ伸ばす
+ function revealUsed(used, t){
+   if(!used||!used.length) return used||[];
+   if(t>=used[used.length-1][0]) return used;   // 全て可視
+   if(t<used[0][0]) return [];                   // まだ何も
+   var out=[];
+   for(var i=0;i<used.length && used[i][0]<=t;i++) out.push(used[i]);
+   var y=interp(used, t);
+   if(y!==null) out.push([t, y]);
+   return out;
+ }
+ // 仮想 now=t で表示すべき 5h セグメントを選ぶ（窓内→そのまま / 窓を過ぎた→直近の過去窓 / 開始前→最古）
+ function pbSegAt(segs, t){
+   var chosen=null;
+   for(var i=0;i<segs.length;i++){
+     var s=segs[i];
+     if(t>=s.x0 && t<=s.x1) return s;
+     if(t>s.x1) chosen=s;
+   }
+   return chosen || segs[0];
  }
  // 縦補助線の目盛り（ローカル時刻境界。setHours/setDate で DST も吸収）
  function hourTicks(x0,x1){
@@ -144,7 +169,11 @@
    cv.width=Math.round(cssW*dpr); cv.height=Math.round(cssH*dpr);
    ctx.setTransform(dpr,0,0,dpr,0,0);
    ctx.clearRect(0,0,cssW,cssH);
-   var p=data&&data.panels[idx]; if(!p) return;
+   // 通常はライブのパネル。プレイバック中は各パネル=仮想now時点のセグメント（無ければライブへ縮退）
+   var p, nowT;
+   if(pb){ nowT=pb.t; p=pbActive(idx, pb.t); }
+   else { nowT=Date.now()/1000; p = data && data.panels[idx]; }
+   if(!p) return;
 
    var pw=cssW-ML-MR, ph=cssH-MT-MB;
    if(pw<10||ph<10) return;
@@ -183,27 +212,27 @@
      ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha=1;
    }
 
-   if(p.used && p.used.length){
-     var grad=paceGradient(ctx, p, X, colorForPace, NEUTRAL);   // 青-灰-赤（無彩色を挟む・不透明）
-     ctx.beginPath(); ctx.moveTo(X(p.used[0][0]), Y(0));
-     p.used.forEach(function(pt){ ctx.lineTo(X(pt[0]), Y(pt[1])); });
-     ctx.lineTo(X(p.used[p.used.length-1][0]), Y(0)); ctx.closePath();
+   var pu = pb ? revealUsed(p.used, nowT) : p.used;   // 再生中はカーソルまで
+   if(pu && pu.length){
+     var grad=paceGradient(ctx, {used:pu, even:p.even}, X, colorForPace, NEUTRAL);   // 青-灰-赤（無彩色を挟む・不透明）
+     ctx.beginPath(); ctx.moveTo(X(pu[0][0]), Y(0));
+     pu.forEach(function(pt){ ctx.lineTo(X(pt[0]), Y(pt[1])); });
+     ctx.lineTo(X(pu[pu.length-1][0]), Y(0)); ctx.closePath();
      ctx.fillStyle=grad; ctx.globalAlpha=0.18; ctx.fill(); ctx.globalAlpha=1;   // フィルは一律18%
      ctx.strokeStyle=grad; ctx.lineWidth=1.8; ctx.beginPath();
-     p.used.forEach(function(pt,i){ var xx=X(pt[0]),yy=Y(pt[1]); i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy); });
+     pu.forEach(function(pt,i){ var xx=X(pt[0]),yy=Y(pt[1]); i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy); });
      ctx.stroke();
    }
 
-   var now=Date.now()/1000;
-   if(now>=x0 && now<=x1){
-     var xn=X(now);
+   if(nowT>=x0 && nowT<=x1){
+     var xn=X(nowT);
      ctx.strokeStyle="#888"; ctx.globalAlpha=0.7; ctx.lineWidth=1; ctx.setLineDash([3,3]);
      ctx.beginPath(); ctx.moveTo(xn,MT); ctx.lineTo(xn,MT+ph); ctx.stroke();
      ctx.setLineDash([]); ctx.globalAlpha=1;
    }
 
    var tip=document.getElementById("t"+idx), ht=hover[idx];
-   if(ht!==null && ht>=x0 && ht<=x1 && p.used && p.used.length){
+   if(!pb && ht!==null && ht>=x0 && ht<=x1 && p.used && p.used.length){
      var np=nearest(p.used, ht), ev=interp(p.even, np[0]);
      var hx=X(np[0]), hy=Y(np[1]);
      ctx.strokeStyle=T().hover; ctx.globalAlpha=0.5; ctx.lineWidth=1; ctx.setLineDash([2,2]);
@@ -223,16 +252,58 @@
    } else { tip.style.opacity=0; }
  }
 
- function drawAll(){ draw(0); draw(1); }
+ function drawAll(){ if(pb) return; draw(0); draw(1); }
 
  function apply(j){
    data=j;
    for(var i=0;i<j.panels.length;i++) setHeader(i, j.panels[i]);
    drawAll();
    document.getElementById("ts").textContent="updated "+hm(new Date());
+   var pbd=j.playback;
+   document.getElementById("play").disabled =
+     !(pbd && ((pbd.seg5h&&pbd.seg5h.length)||(pbd.seg7d&&pbd.seg7d.length)));
+ }
+
+ // ---- プレイバック（直近7d早送り。各パネルの窓リセットも再現） ----
+ function pbActive(idx, t){             // 仮想now=t で表示するセグメント（無ければライブパネルへ縮退）
+   var segs=(idx===0)?pb.seg5h:pb.seg7d;
+   return (segs && segs.length) ? pbSegAt(segs, t) : (data && data.panels[idx]);
+ }
+ function pbHeader(idx, p, t){          // 再生カーソル t 時点の used/even を反映したヘッダ
+   var pu=revealUsed(p.used, t);
+   var un=pu.length ? pu[pu.length-1][1] : null;
+   var ev=(p.even && p.even.length) ? interp(p.even, t) : null;
+   return { key:(idx===0?"5h":"7d"), used_now:un, std_now:(ev===null?0:ev), reset_label:p.reset_label };
+ }
+ function startPlayback(){
+   if(pb) return;
+   var pbd=data && data.playback;
+   var has5=pbd && pbd.seg5h && pbd.seg5h.length, has7=pbd && pbd.seg7d && pbd.seg7d.length;
+   if(!has5 && !has7) return;
+   var start=pbd.start, end=Math.max(pbd.now, Date.now()/1000);
+   if(!(end>start)) return;
+   document.getElementById("play").disabled=true;
+   document.getElementById("ts").textContent="▶ playback";
+   pb={ t:start, seg5h:pbd.seg5h||[], seg7d:pbd.seg7d||[], raf:0 };
+   var t0=performance.now();
+   function frame(){
+     var f=(performance.now()-t0)/PB_DURATION; if(f>1) f=1;
+     pb.t=start+(end-start)*f;
+     setHeader(0, pbHeader(0, pbActive(0, pb.t), pb.t));
+     setHeader(1, pbHeader(1, pbActive(1, pb.t), pb.t));
+     draw(0); draw(1);
+     if(f<1){ pb.raf=requestAnimationFrame(frame); } else { endPlayback(); }
+   }
+   pb.raf=requestAnimationFrame(frame);
+ }
+ function endPlayback(){
+   if(pb && pb.raf) cancelAnimationFrame(pb.raf);
+   pb=null;
+   if(data) apply(data);   // ライブ表示へ復帰（ヘッダ再設定・drawAll・ts更新・ボタン再有効化）
  }
 
  function poll(){
+   if(pb) return;           // 再生中はライブ反映を止める（数秒で復帰）
    fetch("pace.json?t="+Date.now(), {cache:"no-store"})
      .then(function(r){ if(!r.ok) throw 0; return r.json(); })
      .then(function(j){ if(j.generated_at!==lastGen){ lastGen=j.generated_at; apply(j); } })
@@ -242,6 +313,7 @@
  function bindHover(idx){
    var cv=document.getElementById("c"+idx);
    cv.addEventListener("mousemove", function(e){
+     if(pb) return;
      var p=data&&data.panels[idx]; if(!p) return;
      var rect=cv.getBoundingClientRect(), mx=e.clientX-rect.left, pw=cv.clientWidth-ML-MR;
      if(mx<ML || mx>ML+pw){ hover[idx]=null; draw(idx); return; }
@@ -268,6 +340,7 @@
    try{ localStorage.setItem("tp-theme", theme); }catch(e){}
    applyTheme();
  });
+ document.getElementById("play").addEventListener("click", startPlayback);
 
  bindHover(0); bindHover(1);
  window.addEventListener("resize", drawAll);

@@ -35,6 +35,7 @@ RESET_WINDOW = 5
 JST_OFFSET = 9 * 3600  # JST=UTC+9 固定(DST無)
 FIVE_HOUR = 5 * 3600
 SEVEN_DAY = 7 * 86400
+PLAYBACK_SPAN = 7 * 86400   # プレイバック(早送り再生)で遡る既定の長さ=7d
 
 
 def load_biz_config():
@@ -278,6 +279,74 @@ def build_panels(rows, now_epoch, reset5_epoch, reset7_epoch):
     return panels
 
 
+def _playback_segments(rows, start, now_epoch, val_key, reset_key, win_len, even_fn, xmode):
+    """[start, now] に重なる各窓（観測された reset_key ごと）を古い順にセグメント化して返す。
+
+    各窓は既存の window_series で used 包絡線を計算する。ビューアは再生カーソルが窓境界を
+    越えるたびにセグメントを切り替える＝その枠のリセットが再現される。
+    """
+    resets = set()
+    for r in rows:
+        v = r.get(reset_key)
+        try:
+            v = float(v)
+        except (ValueError, TypeError):
+            continue
+        if v > start and (v - win_len) < now_epoch:   # 窓[v-win, v] が [start, now] と重なる
+            resets.add(v)
+
+    segs = []
+    for rr in sorted(resets):
+        xs, ys = window_series(rows, val_key, reset_key, rr, rr - win_len, rr)
+        used = [[x.timestamp(), y] for x, y in zip(xs, ys)]
+        if not used:
+            continue
+        segs.append({
+            "x0": rr - win_len, "x1": rr, "xmode": xmode,
+            "reset_label": _label(rr, xmode),
+            "even": even_fn(rr - win_len, rr),
+            "used": used,
+        })
+    return segs
+
+
+def build_playback(rows, now_epoch):
+    """直近 PLAYBACK_SPAN(=7d) を早送り再生するためのセグメント列（5h/7d 両パネル分）を返す。
+
+    - 期間: [max(now-7d, 最古サンプル), now]（履歴が 7d 未満なら最古サンプルから）。
+    - この期間に重なる 5h 窓・7d 窓をそれぞれ古い順に列挙する。7d スパンでは 5h 窓は多数回、
+      7d 窓も（now-7d が現 7d 窓の開始より前になるため）1 回リセット境界をまたぎ得る。
+      ビューアは各パネルで再生カーソルが境界を越えるたびに窓を切り替える＝リセットが再現される。
+    - 履歴が短ければ各パネル 1 窓に縮退（リセット無し）。
+
+    データが無い/両パネルともセグメントが作れない場合は None。
+    """
+    earliest = None
+    for r in rows:
+        ts = r.get("ts")
+        try:
+            ts = float(ts)
+        except (ValueError, TypeError):
+            continue
+        if earliest is None or ts < earliest:
+            earliest = ts
+    if earliest is None:
+        return None
+    start = max(now_epoch - PLAYBACK_SPAN, earliest)
+
+    def biz_even(x0, x1):
+        bx, by = biz_baseline(x0, x1)
+        return [[x.timestamp(), y] for x, y in zip(bx, by)]
+
+    seg5h = _playback_segments(rows, start, now_epoch, "h5", "h5r", FIVE_HOUR,
+                               lambda x0, x1: [[x0, 0.0], [x1, 100.0]], "time")
+    seg7d = _playback_segments(rows, start, now_epoch, "d7", "d7r", SEVEN_DAY,
+                               biz_even, "date")
+    if not seg5h and not seg7d:
+        return None
+    return {"start": start, "now": now_epoch, "seg5h": seg5h, "seg7d": seg7d}
+
+
 def write_json(rows, now_epoch, reset5_epoch, reset7_epoch):
     """pace.json をアトミック更新（tmp→replace、プロセス固有 tmp）。
 
@@ -288,6 +357,7 @@ def write_json(rows, now_epoch, reset5_epoch, reset7_epoch):
     data = {
         "generated_at": gv if gv is not None else now_epoch,
         "panels": build_panels(rows, now_epoch, reset5_epoch, reset7_epoch),
+        "playback": build_playback(rows, now_epoch),
     }
     tmp = f"{JSON_OUT}.{os.getpid()}.tmp"
     try:
