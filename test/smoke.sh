@@ -77,6 +77,7 @@ do_install || fail "インストール($MODE) が非ゼロ終了"
 [ -x "$TP_DIR/bin/sampler.sh" ]  || fail "sampler.sh 未配置"
 [ -x "$TP_DIR/bin/pace-json.py" ]|| fail "pace-json.py 未配置"
 [ -f "$TP_DIR/bin/serve-http.py" ]|| fail "serve-http.py 未配置"
+[ -x "$TP_DIR/bin/credits-fetch.py" ] || fail "credits-fetch.py 未配置"
 [ -f "$TP_DIR/index.html" ]      || fail "index.html 未配置"
 [ -f "$HOME/.claude/commands/tpw.md" ] || fail "/tpw コマンド未設置"
 got_wrap="$(jq -r '.statusLine.command' "$SETTINGS")"
@@ -263,6 +264,47 @@ jq -e '(.playback.seg7d[0].used | map(.[1]) | max) >= 60' "$QDIR/pace.json" >/de
 jq -e '.playback.seg7d[1].used[0][1] <= 20' "$QDIR/pace.json" >/dev/null \
   || fail "playback7d回帰: 現 7d 窓が低値から始まらない＝リセット未再現 (先頭=$q7b0, 期待<=20)"
 ok "プレイバック(7d): seg7d=2窓・前窓ピーク($q7max)→現窓は低値開始($q7b0)で 7d リセット再現"
+
+# 5m) 月次クレジット枠パネル: credits.jsonl があれば 3 枚目 "1mo" が出る（100% = monthly_limit）。
+#     limit<=0 の行（枠が未割当のときに API が返す monthly_limit=0）は % を定義できないので除外。
+#     even の分母は「窓の実就業秒」。週の総就業秒のままだと月の 1/4 あたりで 100% に張り付く
+#     （＝even の点の 7 割超が 100 になる）ため、その回帰も同時に検証する。
+MDIR="$HOME/month-test"
+mkdir -p "$MDIR"
+python3 - "$MDIR/credits.jsonl" <<'PY'
+import json, sys
+from datetime import datetime
+now = datetime.now().timestamp()
+d = datetime.fromtimestamp(now)
+y, m = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
+w1 = datetime(d.year, d.month, 1).timestamp()
+m1r = int(datetime(y, m, 1).timestamp())
+base = int(max(w1 + 1, now - 180))          # 必ず当月内・昇順になるように基準を取る
+rows = [
+    {"ts": base,      "used": 0,     "limit": 0,      "m1r": m1r},   # 枠未割当 → 除外される
+    {"ts": base + 30, "used": 0,     "limit": 100000, "m1r": m1r},   # 0%
+    {"ts": base + 60, "used": 1000,  "limit": 100000, "m1r": m1r},   # 1%
+    {"ts": base + 90, "used": 25000, "limit": 100000, "m1r": m1r},   # 25%
+]
+with open(sys.argv[1], "w") as f:
+    for r in rows:
+        f.write(json.dumps(r) + "\n")
+PY
+TOKEN_PACE_DIR="$MDIR" python3 "$TP_DIR/bin/pace-json.py" || fail "月次回帰: pace-json.py が非ゼロ終了"
+jq -e '.panels | length == 3' "$MDIR/pace.json" >/dev/null \
+  || fail "月次回帰: panels が 3 でない (len=$(jq -r '.panels|length' "$MDIR/pace.json"))"
+jq -e '.panels[2].key == "1mo" and .panels[2].xmode == "date"' "$MDIR/pace.json" >/dev/null \
+  || fail "月次回帰: 3 枚目が 1mo(date) でない"
+mnow="$(jq -r '.panels[2].used_now' "$MDIR/pace.json")"
+jq -e '.panels[2].used_now == 25' "$MDIR/pace.json" >/dev/null \
+  || fail "月次回帰: used_now が 25 でない (got=$mnow)"
+mlen="$(jq -r '.panels[2].used | length' "$MDIR/pace.json")"
+[ "$mlen" = "3" ] || fail "月次回帰: limit<=0 の行が除外されていない (used 点数=$mlen, 期待 3)"
+mspan="$(jq -r '((.panels[2].x1 - .panels[2].x0) / 86400) | floor' "$MDIR/pace.json")"
+{ [ "$mspan" -ge 27 ] && [ "$mspan" -le 31 ]; } || fail "月次回帰: 窓幅が 1 か月でない ($mspan 日)"
+mpin="$(jq -r '((.panels[2].even | map(select(.[1] >= 99.9)) | length) * 100 / (.panels[2].even | length)) | floor' "$MDIR/pace.json")"
+[ "$mpin" -lt 25 ] || fail "月次回帰: even が早期に 100% へ張り付き（分母が週のまま）: 100% の点が ${mpin}%"
+ok "月次パネル: 3枚目=1mo・used_now=$mnow%・limit<=0 行を除外・even の飽和は ${mpin}% のみ"
 
 # 6) serve.sh が / と /pace.json を配信
 bash "$TP_DIR/bin/serve.sh" >/dev/null || fail "serve.sh が非ゼロ終了"

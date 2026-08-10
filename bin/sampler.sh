@@ -3,13 +3,17 @@
 # install.sh が仕込む statusLine ラッパーからバックグラウンドで呼ばれる想定。
 #
 #   ・SAMPLE_INTERVAL 秒に 1 回だけ記録（statusLine は高頻度に呼ばれるため間引く）
+#   ・CREDITS_INTERVAL 秒に 1 回 月次クレジット枠を取得（デタッチ起動で非ブロッキング）
 #   ・PLOT_INTERVAL 秒に 1 回 pace.json を再生成（デタッチ起動で非ブロッキング）
 #   ・rate_limits が両方 null のとき（API 応答前など）は記録しない
 # 依存: jq / python3
 set -u
 TP_DIR="${TOKEN_PACE_DIR:-$HOME/.claude/token-pace}"
-GEN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pace-json.py"
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GEN="$BIN_DIR/pace-json.py"
+FETCH="$BIN_DIR/credits-fetch.py"
 SAMPLE_INTERVAL=30
+CREDITS_INTERVAL=300
 PLOT_INTERVAL=180
 
 mkdir -p "$TP_DIR" 2>/dev/null
@@ -45,6 +49,18 @@ if command -v flock >/dev/null 2>&1; then      # 排他は flock がある環境
   ( flock 9; printf '%s\n' "$row" >>"$TP_DIR/pace.jsonl" ) 9>"$TP_DIR/.lock"
 else
   printf '%s\n' "$row" >>"$TP_DIR/pace.jsonl"
+fi
+
+# 月次クレジット枠の取得（statusLine には来ないので API から。デタッチ起動で遅延させない）
+_clast=0; [[ -f "$TP_DIR/.last_credits" ]] && _clast=$(<"$TP_DIR/.last_credits")
+[[ $_clast =~ ^[0-9]+$ ]] || _clast=0
+if (( _now - _clast >= CREDITS_INTERVAL )); then
+  printf '%s' "$_now" > "$TP_DIR/.last_credits"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid python3 "$FETCH" >/dev/null 2>&1 </dev/null &
+  else
+    nohup  python3 "$FETCH" >/dev/null 2>&1 </dev/null &
+  fi
 fi
 
 # pace.json 再生成の間引き（デタッチ起動で status line を遅延させない）

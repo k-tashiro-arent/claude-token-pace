@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """pace.jsonl -> pace.json（ブラウザ用の処理済み系列）。標準ライブラリのみ・matplotlib/PNG 不要。
 
-- 入力 : $TOKEN_PACE_DIR/pace.jsonl  (1行1サンプル。sampler が append)
+- 入力 : $TOKEN_PACE_DIR/pace.jsonl     (1行1サンプル。sampler が append)
+         $TOKEN_PACE_DIR/credits.jsonl (月次クレジット枠。credits-fetch.py が append。任意)
 - 出力 : $TOKEN_PACE_DIR/pace.json   (tmp -> os.replace でアトミック更新)
-- 設定 : $TOKEN_PACE_DIR/biz-hours.json  (7d の標準ペース基準。無い/不正なら既定 月-金 9-18)
+- 設定 : $TOKEN_PACE_DIR/biz-hours.json  (標準ペースの基準。無い/不正なら既定 月-金 9-18)
 
 used% の単調化: レート枠はアカウント共有だが、各セッションは自分が最後に受けた API レスポンス
 時点の used%/resets_at しか持たない。pace.jsonl には複数セッションが混在するため、
@@ -20,6 +21,7 @@ from datetime import datetime
 
 TP_DIR = os.path.expanduser(os.environ.get("TOKEN_PACE_DIR") or "~/.claude/token-pace")
 LOG = os.path.join(TP_DIR, "pace.jsonl")
+CREDITS_LOG = os.path.join(TP_DIR, "credits.jsonl")
 JSON_OUT = os.path.join(TP_DIR, "pace.json")
 LOCK = os.path.join(TP_DIR, ".lock")
 BIZ_CONFIG = os.path.join(TP_DIR, "biz-hours.json")
@@ -61,10 +63,10 @@ def load_biz_config():
 BIZ_DAYS, BIZ_START_HOUR, BIZ_END_HOUR = load_biz_config()
 
 
-def read_rows():
+def read_jsonl(path):
     rows = []
     try:
-        with open(LOG, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -76,6 +78,10 @@ def read_rows():
     except FileNotFoundError:
         return []
     return rows
+
+
+def read_rows():
+    return read_jsonl(LOG)
 
 
 def prune_if_needed(total):
@@ -199,14 +205,19 @@ def bizsec(t0, t1):
     return acc
 
 
-def biz_baseline(win_start, reset7, step=600):
-    """7d 標準ペース: 就業時間の累積で 0→100%(階段状)。(xs, ys) を返す。"""
-    total = len(BIZ_DAYS) * (BIZ_END_HOUR - BIZ_START_HOUR) * 3600
+def biz_baseline(win_start, win_end, step=600):
+    """標準ペース: 窓内の就業時間の累積で 0→100%(階段状)。(xs, ys) を返す。
+
+    分母は「窓の実就業秒」。7d 窓は 168h＝ちょうど 1 週間周期なので、開始位置に関わらず
+    週の総就業秒に一致する（＝従来の定数分母と完全に同値）。月次のような可変長窓では
+    窓ごとの正しい分母になる（定数のままだと 1 週間ぶんで 100% に張り付く）。
+    """
+    total = bizsec(win_start, win_end)
     if total <= 0:
         return [], []
     xs, ys = [], []
     t = win_start
-    while t <= reset7:
+    while t <= win_end:
         y = bizsec(win_start, t) / total * 100.0
         xs.append(datetime.fromtimestamp(t))
         ys.append(min(100.0, max(0.0, y)))
@@ -267,7 +278,7 @@ def build_panels(rows, now_epoch, reset5_epoch, reset7_epoch):
         even = [[x.timestamp(), y] for x, y in zip(bx, by)]
     else:
         even = []
-    biz_total = len(BIZ_DAYS) * (BIZ_END_HOUR - BIZ_START_HOUR) * 3600
+    biz_total = bizsec(w7, r7)   # 7d 窓では週の総就業秒に一致（biz_baseline と同じ分母）
     std7 = max(0.0, min(100.0, bizsec(w7, now_epoch) / biz_total * 100.0)) if biz_total else 0.0
     panels.append({
         "key": "7d", "xmode": "date",
@@ -279,7 +290,87 @@ def build_panels(rows, now_epoch, reset5_epoch, reset7_epoch):
     return panels
 
 
-def _playback_segments(rows, start, now_epoch, val_key, reset_key, win_len, even_fn, xmode):
+def month_bounds(epoch):
+    """epoch を含む月の [1日00:00, 翌月1日00:00)(ローカル) を返す。"""
+    d = datetime.fromtimestamp(epoch)
+    y, m = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
+    return datetime(d.year, d.month, 1).timestamp(), datetime(y, m, 1).timestamp()
+
+
+def compress_steps(pts):
+    """同値が続く区間を両端だけ残して間引く（階段の形は保つ）。
+
+    クレジットはプラン枠を超えている間しか増えないため、大半の行は前後と同値になる。
+    値が変わる点とその直前・直後を残すので、間引き後も系列の形状は変わらない。
+    """
+    n = len(pts)
+    if n <= 2:
+        return list(pts)
+    out = [pts[0]]
+    for i in range(1, n - 1):
+        if pts[i][1] != pts[i - 1][1] or pts[i][1] != pts[i + 1][1]:
+            out.append(pts[i])
+    out.append(pts[-1])
+    return out
+
+
+def build_month_panel(crows, now_epoch):
+    """月次クレジット枠（extra usage）のパネル。credits.jsonl が無ければ None。
+
+    100% = monthly_limit（＝支出上限）。5h/7d と違い「使い切ってよい枠」ではないので、
+    even ペース（満額基準）に対して灰色＝上限を使い切る軌道である点に注意。
+
+    5h/7d と違い envelope（running-max）は掛けない。複数セッションが書く pace.jsonl と
+    違って credits.jsonl は単一の取得器が書くので stale 混在が起きず、月替わりで値が
+    0 に戻る系列に running-max を掛けると誤って前月のピークを引きずるため。
+    """
+    if not crows:
+        return None
+    target = max_reset(crows, "m1r")     # 観測された最大の m1r＝現在の月次窓
+    if target is None:
+        return None
+    w1 = month_bounds(target - 1)[0]     # m1r は翌月1日00:00 なので 1 秒引いて当月に落とす
+    r1 = target
+
+    pts = []
+    for r in crows:
+        ts, used, limit = r.get("ts"), r.get("used"), r.get("limit")
+        if ts is None or used is None or limit is None:
+            continue
+        try:
+            ts, used, limit = float(ts), float(used), float(limit)
+        except (ValueError, TypeError):
+            continue
+        if limit <= 0:
+            continue     # 枠未割当（monthly_limit=0）は % を定義できない
+        m1r = r.get("m1r")
+        if m1r is not None:
+            try:
+                if float(m1r) != target:
+                    continue     # 別の月の観測
+            except (ValueError, TypeError):
+                pass
+        if ts < w1 or ts > r1:
+            continue
+        pts.append((ts, max(0.0, min(100.0, used / limit * 100.0))))
+    pts.sort(key=lambda x: x[0])
+    if not pts:
+        return None
+    used = [[t, y] for t, y in compress_steps(pts)]
+
+    bx, by = biz_baseline(w1, r1, step=1800)   # 月は長いので 30 分刻み（点数を抑える）
+    even = [[x.timestamp(), y] for x, y in zip(bx, by)]
+    denom = bizsec(w1, r1)
+    std1 = max(0.0, min(100.0, bizsec(w1, now_epoch) / denom * 100.0)) if denom > 0 else 0.0
+    return {
+        "key": "1mo", "xmode": "date",
+        "x0": w1, "x1": r1, "reset_label": _label(r1, "date"),
+        "used": used, "even": even,
+        "used_now": used[-1][1], "std_now": std1,
+    }
+
+
+def _playback_segments(rows, start, now_epoch, key, val_key, reset_key, win_len, even_fn, xmode):
     """[start, now] に重なる各窓（観測された reset_key ごと）を古い順にセグメント化して返す。
 
     各窓は既存の window_series で used 包絡線を計算する。ビューアは再生カーソルが窓境界を
@@ -302,7 +393,7 @@ def _playback_segments(rows, start, now_epoch, val_key, reset_key, win_len, even
         if not used:
             continue
         segs.append({
-            "x0": rr - win_len, "x1": rr, "xmode": xmode,
+            "key": key, "x0": rr - win_len, "x1": rr, "xmode": xmode,
             "reset_label": _label(rr, xmode),
             "even": even_fn(rr - win_len, rr),
             "used": used,
@@ -338,25 +429,32 @@ def build_playback(rows, now_epoch):
         bx, by = biz_baseline(x0, x1)
         return [[x.timestamp(), y] for x, y in zip(bx, by)]
 
-    seg5h = _playback_segments(rows, start, now_epoch, "h5", "h5r", FIVE_HOUR,
+    seg5h = _playback_segments(rows, start, now_epoch, "5h", "h5", "h5r", FIVE_HOUR,
                                lambda x0, x1: [[x0, 0.0], [x1, 100.0]], "time")
-    seg7d = _playback_segments(rows, start, now_epoch, "d7", "d7r", SEVEN_DAY,
+    seg7d = _playback_segments(rows, start, now_epoch, "7d", "d7", "d7r", SEVEN_DAY,
                                biz_even, "date")
     if not seg5h and not seg7d:
         return None
     return {"start": start, "now": now_epoch, "seg5h": seg5h, "seg7d": seg7d}
 
 
-def write_json(rows, now_epoch, reset5_epoch, reset7_epoch):
+def write_json(rows, crows, now_epoch, reset5_epoch, reset7_epoch):
     """pace.json をアトミック更新（tmp→replace、プロセス固有 tmp）。
 
     generated_at は最新サンプル ts（＝データのバージョン）。ブラウザはこの値の
     変化だけを見て再描画するので、内容が変わらない再生成では再描画しない。
+    クレジット側だけが更新された場合も再描画させるため、両ログの最大 ts を採る。
     """
-    gv = latest_ts(rows)
+    gv, gc = latest_ts(rows), latest_ts(crows)
+    if gc is not None and (gv is None or gc > gv):
+        gv = gc
+    panels = build_panels(rows, now_epoch, reset5_epoch, reset7_epoch)
+    month = build_month_panel(crows, now_epoch)
+    if month is not None:
+        panels.append(month)     # credits.jsonl が無い環境では 5h/7d の 2 枚のまま
     data = {
         "generated_at": gv if gv is not None else now_epoch,
-        "panels": build_panels(rows, now_epoch, reset5_epoch, reset7_epoch),
+        "panels": panels,
         "playback": build_playback(rows, now_epoch),
     }
     tmp = f"{JSON_OUT}.{os.getpid()}.tmp"
@@ -390,12 +488,13 @@ def main():
 
     rows = read_rows()
     prune_if_needed(len(rows))
+    crows = read_jsonl(CREDITS_LOG)         # 任意。無ければ月次パネルを出さない
 
     now_epoch = datetime.now().timestamp()
     reset5_epoch = max_reset(rows, "h5r")   # 最大 ts 行ではなく最大 resets_at＝最新窓（後退防止）
     reset7_epoch = max_reset(rows, "d7r")
 
-    write_json(rows, now_epoch, reset5_epoch, reset7_epoch)
+    write_json(rows, crows, now_epoch, reset5_epoch, reset7_epoch)
 
 
 if __name__ == "__main__":

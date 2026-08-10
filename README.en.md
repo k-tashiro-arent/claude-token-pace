@@ -14,12 +14,12 @@ An interactive, browser-based viewer for your Claude Code **token consumption pa
 - **even pace (dotted)**: the standard consumption pace. Linear for 5h, a business-hours staircase for 7d.
 - **now line**: current time (updated every second). Hover to read used / even / pace deviation at any point.
 
-Top panel = 5h window (the 5 hours until the next 5h reset), bottom panel = 7d window (the 7 days until the next 7d reset).
+Top panel = 5h window (the 5 hours until the next 5h reset), bottom panel = 7d window (the 7 days until the next 7d reset). **On accounts with a monthly usage-credit allowance (extra usage), a third panel** (until the next month-start reset) is shown as well.
 
 ## Why
 - **Runs on your existing Claude subscription** — no API key, no extra cost. It just reads the rate-limit data Claude Code already has.
 - **Business-hours-aware pace** — the 7-day even pace follows your working hours (a staircase), not a flat line, so "am I burning too fast?" is actually meaningful.
-- **Local & private** — bound to `127.0.0.1` only; your usage data accumulates on your own machine and is never exposed to the LAN or anywhere else.
+- **Local & private** — bound to `127.0.0.1` only; your usage data accumulates on your own machine and is never exposed to the LAN or anywhere else (the only outbound traffic is the read-only request that fetches the monthly panel — see [Monthly usage credits](#monthly-usage-credits-extra-usage)).
 
 ## Requirements
 - **OS**: Linux / macOS / WSL2 (**native Windows is not supported**)
@@ -75,6 +75,17 @@ A local HTTP server (`127.0.0.1`) starts and the viewer opens in your default br
 - The 5h/7d limits are **per account (user), not per session**. With several concurrent sessions, each session's status line writes to the **same** `pace.jsonl`, so the recorded value is always your account-wide usage (more sessions just means more frequent sampling).
 - Data accumulates **locally, per installed environment** (`~/.claude/token-pace/pace.jsonl`). History is not shared across machines — each environment builds its own. Right after install there is no history, so the panels (especially the 7-day one) fill in as you keep using Claude Code.
 
+## Monthly usage credits (extra usage)
+
+Spend beyond your plan limits (usage credits) is **not present in the statusLine JSON**, so it cannot be collected the way the 5h/7d values are. This one panel is therefore fetched from the same endpoint Claude Code itself uses.
+
+- Fetch: `GET https://api.anthropic.com/api/oauth/usage`, roughly **once every 5 minutes** (`bin/credits-fetch.py`)
+- Auth: **reads** the OAuth access token from `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`). If the token is expired it does nothing — refreshing is left to Claude Code itself
+- Storage: `~/.claude/token-pace/credits.jsonl` (`{ts, used, limit, m1r}`; amounts in the API's minor units, i.e. cents for USD)
+- Where this isn't available (macOS Keychain-stored credentials, plans without extra usage, …) **nothing is recorded and the panel is not shown** — 5h/7d keep working as before
+
+**Note**: 100% on this panel is `monthly_limit`, a **spend ceiling** — unlike the 5h/7d windows, which are allowances you are meant to consume. Sitting exactly on the even pace (gray) means you are on track to spend the entire ceiling.
+
 ## Configuration
 ### Port (`~/.claude/token-pace/config.json`)
 ```json
@@ -91,7 +102,7 @@ The basis for the 7d panel's even pace.
 - `biz_start_hour` / `biz_end_hour`: working hours (JST, decimals allowed)
 
 ## Data location
-`~/.claude/token-pace/` (`pace.jsonl` = records, `pace.json` = viewer input, `index.html`, config/state files). Bound to `127.0.0.1`, so it is never exposed to the LAN.
+`~/.claude/token-pace/` (`pace.jsonl` = records, `credits.jsonl` = monthly usage-credit records, `pace.json` = viewer input, `index.html`, config/state files). Bound to `127.0.0.1`, so it is never exposed to the LAN.
 
 ## Uninstall
 ```bash

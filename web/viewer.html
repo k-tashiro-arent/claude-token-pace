@@ -18,6 +18,7 @@
  #theme:hover,#play:hover{background:var(--tipbg);}
  #play:disabled{opacity:.4;cursor:default;}
  #play:disabled:hover{background:transparent;}
+ .panels{flex:1;display:flex;flex-direction:column;min-height:0;}
  .panel{flex:1;display:flex;flex-direction:column;min-height:0;}
  .phead{position:absolute;top:10px;left:44px;z-index:3;pointer-events:none;
    font-size:15px;font-variant-numeric:tabular-nums;white-space:nowrap;}
@@ -31,10 +32,7 @@
 </style></head>
 <body><div class="wrap">
  <header><span class="right"><span id="ts">loading…</span><button id="play" title="直近7dを早送り再生" disabled>▶</button><button id="theme" title="テーマ切替">◐</button></span></header>
- <div class="panel">
-   <div class="pcanvas"><canvas id="c0"></canvas><div class="phead" id="h0">…</div><div class="tip" id="t0"></div></div></div>
- <div class="panel">
-   <div class="pcanvas"><canvas id="c1"></canvas><div class="phead" id="h1">…</div><div class="tip" id="t1"></div></div></div>
+ <div class="panels" id="panels"></div>
 </div>
 <script>
 (function(){
@@ -44,8 +42,8 @@
    dark: {grid:"#2a2f3a",axis:"#3a414e",label:"#7a828f",hover:"#99a3b3",dot:"#0f1115"},
    light:{grid:"#e2e5ea",axis:"#c2c8d0",label:"#6b7480",hover:"#66707e",dot:"#ffffff"}
  };
- var ML=40, MR=8, MT=6, MB=18;
- var data=null, lastGen=null, hover=[null,null], theme="dark";
+ var ML=40, MR=8, MT=6, MB=18, MAX_TICKS=12;
+ var data=null, lastGen=null, hover=[], theme="dark", panelCount=0;
  var pb=null;                 // プレイバック中の状態 {t:仮想now(epoch秒), seg5h:[…], seg7d:[…], raf:id}
  var PB_DURATION=6000;        // 早送り全体の所要(ms)
  function T(){ return THEMES[theme]||THEMES.dark; }
@@ -144,6 +142,23 @@
    return g;
  }
 
+ // パネル DOM をデータのパネル数に合わせて作り直す（5h/7d の 2 枚、月次があれば 3 枚）
+ function ensurePanels(n){
+   if(n===panelCount) return;
+   var host=document.getElementById("panels");
+   host.innerHTML="";
+   for(var i=0;i<n;i++){
+     var d=document.createElement("div");
+     d.className="panel";
+     d.innerHTML='<div class="pcanvas"><canvas id="c'+i+'"></canvas>'
+       +'<div class="phead" id="h'+i+'">…</div><div class="tip" id="t'+i+'"></div></div>';
+     host.appendChild(d);
+   }
+   hover=[]; for(var j=0;j<n;j++) hover.push(null);
+   panelCount=n;
+   for(var k=0;k<n;k++) bindHover(k);
+ }
+
  function setHeader(idx, p){
    var h=document.getElementById("h"+idx);
    if(p.used_now===null || p.used_now===undefined){
@@ -188,8 +203,13 @@
      ctx.beginPath(); ctx.moveTo(ML,y+0.5); ctx.lineTo(ML+pw,y+0.5); ctx.stroke();
      ctx.fillStyle=T().label; ctx.textAlign="right"; ctx.fillText(String(g), ML-5, y);
    });
-   // 縦補助線 + X軸目盛り（同じ位置）: 5h=1時間ごと / 7d=1日ごと
+   // 縦補助線 + X軸目盛り（同じ位置）: 5h=1時間ごと / 7d=1日ごと。多すぎる場合は間引く（月次=31日）
    var ticks = (p.xmode==="date" ? dayTicks(x0,x1) : hourTicks(x0,x1));
+   if(ticks.length>MAX_TICKS){
+     var st=Math.ceil(ticks.length/MAX_TICKS), th=[];
+     for(var ti=0;ti<ticks.length;ti+=st) th.push(ticks[ti]);
+     ticks=th;
+   }
    ctx.strokeStyle=T().grid; ctx.lineWidth=1;
    ticks.forEach(function(t){
      var gx=Math.round(X(t))+0.5;
@@ -252,10 +272,11 @@
    } else { tip.style.opacity=0; }
  }
 
- function drawAll(){ if(pb) return; draw(0); draw(1); }
+ function drawAll(){ if(pb) return; for(var i=0;i<panelCount;i++) draw(i); }
 
  function apply(j){
    data=j;
+   ensurePanels(j.panels.length);
    for(var i=0;i<j.panels.length;i++) setHeader(i, j.panels[i]);
    drawAll();
    document.getElementById("ts").textContent="updated "+hm(new Date());
@@ -266,14 +287,14 @@
 
  // ---- プレイバック（直近7d早送り。各パネルの窓リセットも再現） ----
  function pbActive(idx, t){             // 仮想now=t で表示するセグメント（無ければライブパネルへ縮退）
-   var segs=(idx===0)?pb.seg5h:pb.seg7d;
+   var segs=(idx===0)?pb.seg5h:(idx===1?pb.seg7d:null);   // 月次パネルは再生対象外＝ライブのまま
    return (segs && segs.length) ? pbSegAt(segs, t) : (data && data.panels[idx]);
  }
  function pbHeader(idx, p, t){          // 再生カーソル t 時点の used/even を反映したヘッダ
    var pu=revealUsed(p.used, t);
    var un=pu.length ? pu[pu.length-1][1] : null;
    var ev=(p.even && p.even.length) ? interp(p.even, t) : null;
-   return { key:(idx===0?"5h":"7d"), used_now:un, std_now:(ev===null?0:ev), reset_label:p.reset_label };
+   return { key:(p.key||""), used_now:un, std_now:(ev===null?0:ev), reset_label:p.reset_label };
  }
  function startPlayback(){
    if(pb) return;
@@ -289,9 +310,11 @@
    function frame(){
      var f=(performance.now()-t0)/PB_DURATION; if(f>1) f=1;
      pb.t=start+(end-start)*f;
-     setHeader(0, pbHeader(0, pbActive(0, pb.t), pb.t));
-     setHeader(1, pbHeader(1, pbActive(1, pb.t), pb.t));
-     draw(0); draw(1);
+     for(var i=0;i<panelCount;i++){
+       var ap=pbActive(i, pb.t);
+       if(ap) setHeader(i, pbHeader(i, ap, pb.t));
+       draw(i);
+     }
      if(f<1){ pb.raf=requestAnimationFrame(frame); } else { endPlayback(); }
    }
    pb.raf=requestAnimationFrame(frame);
@@ -342,8 +365,8 @@
  });
  document.getElementById("play").addEventListener("click", startPlayback);
 
- bindHover(0); bindHover(1);
  window.addEventListener("resize", drawAll);
+ ensurePanels(2);          // pace.json 到着前でも枠を出す（到着後に月次があれば 3 枚へ）
  poll(); setInterval(poll, POLL_MS); setInterval(drawAll, TICK_MS);
 })();
 </script>
