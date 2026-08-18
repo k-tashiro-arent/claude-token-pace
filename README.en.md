@@ -87,6 +87,20 @@ Spend beyond your plan limits (usage credits) is **not present in the statusLine
 
 **Note**: 100% on this panel is `monthly_limit`, a **spend ceiling** — unlike the 5h/7d windows, which are allowances you are meant to consume. Sitting exactly on the even pace (gray) means you are on track to spend the entire ceiling.
 
+## Codex rate limits (optional)
+
+If you also use the [Codex CLI](https://github.com/openai/codex), its usage can be shown in the same view. Codex has no statusLine-style hook, so this reads **the session logs the CLI itself writes**.
+
+- Source: `$CODEX_HOME` (default `~/.codex`) `/sessions/**/rollout-*.jsonl`, the `token_count` events — each carries the rate limits returned with that response
+- Only **`timestamp` and the `rate_limits` numbers** are extracted. Conversation content and tool output are never read or copied (`bin/codex-scan.py`)
+- Storage: `~/.claude/token-pace/codex.jsonl` (`{ts, u, w, r}` = used% / window length in minutes / resets_at; `u2, w2, r2` added when a secondary limit exists)
+- Collected about once every 2 minutes. Bytes already read are tracked in `.codex_scan.json`, so only **appended data** is parsed (a full pass happens once, going back 60 days by default)
+- Where Codex isn't installed, nothing is recorded and no panel is shown
+
+Window length comes from `window_minutes` rather than a constant, so it follows changes in the limit structure (5h+7d vs. 7d only). Windows of a day or less use the linear even pace (like 5h); longer windows use the business-hours staircase (like 7d).
+
+**Limitation**: the Codex credit balance cannot be obtained — `rate_limits.credits.balance` is always `null`. There is no equivalent of the monthly panel. Note also that the rollout log is Codex CLI's internal format and may change between versions (if it becomes unreadable, the panel is simply not shown).
+
 ## Configuration
 ### Port (`~/.claude/token-pace/config.json`)
 ```json
@@ -103,7 +117,7 @@ The basis for the 7d panel's even pace.
 - `biz_start_hour` / `biz_end_hour`: working hours (JST, decimals allowed)
 
 ## Data location
-`~/.claude/token-pace/` (`pace.jsonl` = records, `credits.jsonl` = monthly usage-credit records, `pace.json` = viewer input, `index.html`, config/state files). Bound to `127.0.0.1`, so it is never exposed to the LAN.
+`~/.claude/token-pace/` (`pace.jsonl` = records, `credits.jsonl` = monthly usage-credit records, `codex.jsonl` = Codex rate-limit records, `pace.json` = viewer input, `index.html`, config/state files). Bound to `127.0.0.1`, so it is never exposed to the LAN.
 
 ## Uninstall
 ```bash

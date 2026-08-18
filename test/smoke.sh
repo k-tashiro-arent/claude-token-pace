@@ -78,6 +78,7 @@ do_install || fail "インストール($MODE) が非ゼロ終了"
 [ -x "$TP_DIR/bin/pace-json.py" ]|| fail "pace-json.py 未配置"
 [ -f "$TP_DIR/bin/serve-http.py" ]|| fail "serve-http.py 未配置"
 [ -x "$TP_DIR/bin/credits-fetch.py" ] || fail "credits-fetch.py 未配置"
+[ -x "$TP_DIR/bin/codex-scan.py" ] || fail "codex-scan.py 未配置"
 [ -f "$TP_DIR/index.html" ]      || fail "index.html 未配置"
 [ -f "$HOME/.claude/commands/tpw.md" ] || fail "/tpw コマンド未設置"
 got_wrap="$(jq -r '.statusLine.command' "$SETTINGS")"
@@ -310,6 +311,122 @@ jq -e '((.panels[2].x0 | floor) % 86400 == 0) and ((.panels[2].x1 | floor) % 864
   "$MDIR/pace.json" >/dev/null \
   || fail "月次回帰: 窓境界が UTC 月初でない (x0=$(jq -r '.panels[2].x0' "$MDIR/pace.json"))"
 ok "月次パネル: 3枚目=1mo・used_now=$mnow%・limit<=0 行を除外・even の飽和は ${mpin}% のみ・窓境界は UTC 月初"
+
+# 5x) Codex パネル: rollout ログ(token_count/rate_limits)を増分収集し、primary/secondary
+#     それぞれをパネル化する。実データで確認した性質を再現して検証する:
+#       ・resets_at が同一窓でも数秒ゆらぐ → 許容内は同じ窓として束ねる
+#       ・同一窓で used% が逆行する（並行セッションの古い観測）→ 包絡線で吸収
+#       ・古い窓の観測は現在窓に混ぜない
+#       ・2 回目の実行は追記分だけを読む（増分スキャン）
+XDIR="$HOME/codex-test"
+XHOME="$HOME/fake-codex"
+mkdir -p "$XDIR" "$XHOME/sessions/2026/08/17"
+ROLL="$XHOME/sessions/2026/08/17/rollout-test.jsonl"
+python3 - "$ROLL" <<'PY'
+import json, sys, time
+now = int(time.time())
+r7 = now + 3 * 86400        # 7d 窓（primary）
+r5 = now + 3600             # 5h 窓（secondary）
+def rec(dt, u, r, u2=None):
+    p = {"type": "token_count",
+         "info": {"total_token_usage": {"total_tokens": 1}},
+         "rate_limits": {"limit_id": "codex", "limit_name": None,
+                         "primary": {"used_percent": u, "window_minutes": 10080, "resets_at": r},
+                         "secondary": None,
+                         "credits": {"has_credits": True, "unlimited": False, "balance": None},
+                         "plan_type": "team"}}
+    if u2 is not None:
+        p["rate_limits"]["secondary"] = {"used_percent": u2, "window_minutes": 300, "resets_at": r5}
+    return {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now + dt)),
+            "type": "event_msg", "payload": p}
+rows = [
+    rec(-8 * 86400, 90, r7 - 7 * 86400),   # 1 つ前の窓 → 現在窓には混ぜない
+    rec(-3000, 10, r7,      20),
+    rec(-2400, 20, r7 + 7),                # resets_at のゆらぎ(+7秒)
+    rec(-1800, 30, r7 + 12),               # 同(+12秒)
+    rec(-1200, 24, r7 + 12),               # 逆行（古い観測）→ 包絡で 30 のまま
+    rec(-600,  35, r7,      60),
+]
+with open(sys.argv[1], "w") as f:
+    for r in rows:
+        f.write(json.dumps(r) + "\n")
+    f.write('{"type":"response_item","payload":{"type":"message","content":"SECRET-BODY"}}\n')
+PY
+TOKEN_PACE_DIR="$XDIR" CODEX_HOME="$XHOME" python3 "$TP_DIR/bin/codex-scan.py" \
+  || fail "codex回帰: codex-scan.py が非ゼロ終了"
+[ -f "$XDIR/codex.jsonl" ] || fail "codex回帰: codex.jsonl 未生成"
+xrows="$(wc -l < "$XDIR/codex.jsonl" | tr -d '[:space:]')"
+[ "$xrows" = "6" ] || fail "codex回帰: 収集行数が 6 でない (got=$xrows)"
+if grep -q 'SECRET-BODY' "$XDIR/codex.jsonl"; then fail "codex回帰: 会話本文が codex.jsonl に混入した"; fi
+tail -1 "$XDIR/codex.jsonl" | jq -e 'has("ts") and has("u") and has("w") and has("r")' >/dev/null \
+  || fail "codex回帰: 収集行に必要フィールドが無い"
+
+TOKEN_PACE_DIR="$XDIR" python3 "$TP_DIR/bin/pace-json.py" || fail "codex回帰: pace-json.py が非ゼロ終了"
+jq -e '.panels | length == 4' "$XDIR/pace.json" >/dev/null \
+  || fail "codex回帰: panels が 4 でない (len=$(jq -r '.panels|length' "$XDIR/pace.json"))"
+jq -e '.panels[2].key == "codex 7d" and .panels[2].xmode == "date"' "$XDIR/pace.json" >/dev/null \
+  || fail "codex回帰: 3枚目が codex 7d(date) でない (got=$(jq -r '.panels[2].key' "$XDIR/pace.json"))"
+jq -e '.panels[3].key == "codex 5h" and .panels[3].xmode == "time"' "$XDIR/pace.json" >/dev/null \
+  || fail "codex回帰: 4枚目が codex 5h(time) でない (got=$(jq -r '.panels[3].key' "$XDIR/pace.json"))"
+xn="$(jq -r '.panels[2].used_now' "$XDIR/pace.json")"
+xl="$(jq -r '.panels[2].used | length' "$XDIR/pace.json")"
+jq -e '.panels[2].used_now == 35 and (.panels[2].used | length) == 5' "$XDIR/pace.json" >/dev/null \
+  || fail "codex回帰: 現在窓の点が想定外（used_now=$xn 点数=$xl, 期待 35 / 5＝古い窓を除外）"
+jq -e '[.panels[2].used[] | select(.[1] < 30 and .[1] > 20)] | length == 0' "$XDIR/pace.json" >/dev/null \
+  || fail "codex回帰: 逆行(24%)が包絡で吸収されていない"
+jq -e '((.panels[2].x1 - .panels[2].x0) == 604800) and ((.panels[3].x1 - .panels[3].x0) == 18000)' \
+  "$XDIR/pace.json" >/dev/null || fail "codex回帰: 窓長が window_minutes と一致しない"
+jq -e '.panels[3].used_now == 60' "$XDIR/pace.json" >/dev/null \
+  || fail "codex回帰: secondary(5h) の used_now が 60 でない"
+
+# 増分スキャン: 追記した 1 行だけを読み、既読分を二重取り込みしない
+python3 - "$ROLL" <<'PY'
+import json, sys, time
+now = int(time.time())
+rec = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now - 60)),
+       "type": "event_msg",
+       "payload": {"type": "token_count", "info": {},
+                   "rate_limits": {"limit_id": "codex",
+                                   "primary": {"used_percent": 40, "window_minutes": 10080,
+                                               "resets_at": now + 3 * 86400},
+                                   "secondary": None}}}
+with open(sys.argv[1], "a") as f:
+    f.write(json.dumps(rec) + "\n")
+PY
+TOKEN_PACE_DIR="$XDIR" CODEX_HOME="$XHOME" python3 "$TP_DIR/bin/codex-scan.py" \
+  || fail "codex回帰(増分): codex-scan.py が非ゼロ終了"
+xrows2="$(wc -l < "$XDIR/codex.jsonl" | tr -d '[:space:]')"
+[ "$xrows2" = "7" ] || fail "codex回帰(増分): 追記分のみ取り込めていない (got=$xrows2, 期待 7)"
+ok "Codex パネル: 7d/5h の 2 枚・ゆらぎ吸収・逆行を包絡・古い窓を除外・増分スキャン($xrows→$xrows2 行)・本文非混入"
+
+# 5y) 終了済みの窓はパネルにしない。Codex は 5h+7d → 7d へ枠構成が変わった実績があり、
+#     消えた枠の最後の観測をそのまま描くと現在の枠として誤読されるため。
+YDIR="$HOME/codex-expired-test"
+YHOME="$HOME/fake-codex-expired"
+mkdir -p "$YDIR" "$YHOME/sessions/2026/08/17"
+python3 - "$YHOME/sessions/2026/08/17/rollout-expired.jsonl" <<'PY'
+import json, sys, time
+now = int(time.time())
+rec = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now - 600)),
+       "type": "event_msg",
+       "payload": {"type": "token_count", "info": {},
+                   "rate_limits": {
+                       "limit_id": "codex",
+                       "primary":   {"used_percent": 12, "window_minutes": 10080,
+                                     "resets_at": now + 3 * 86400},      # 現在窓
+                       "secondary": {"used_percent": 90, "window_minutes": 300,
+                                     "resets_at": now - 30 * 86400}}}}   # 30日前に終了
+with open(sys.argv[1], "w") as f:
+    f.write(json.dumps(rec) + "\n")
+PY
+TOKEN_PACE_DIR="$YDIR" CODEX_HOME="$YHOME" python3 "$TP_DIR/bin/codex-scan.py" \
+  || fail "codex期限切れ回帰: codex-scan.py が非ゼロ終了"
+TOKEN_PACE_DIR="$YDIR" python3 "$TP_DIR/bin/pace-json.py" || fail "codex期限切れ回帰: pace-json.py が非ゼロ終了"
+jq -e '.panels | length == 3' "$YDIR/pace.json" >/dev/null \
+  || fail "codex期限切れ回帰: 終了済み窓のパネルが出ている (len=$(jq -r '.panels|length' "$YDIR/pace.json"), 期待 3)"
+jq -e '.panels[2].key == "codex 7d"' "$YDIR/pace.json" >/dev/null \
+  || fail "codex期限切れ回帰: 現在窓(7d)のパネルが無い"
+ok "Codex: 終了済みの窓(5h)はパネル化せず、現在窓(7d)のみ残る"
 
 # 6) serve.sh が / と /pace.json を配信
 bash "$TP_DIR/bin/serve.sh" >/dev/null || fail "serve.sh が非ゼロ終了"

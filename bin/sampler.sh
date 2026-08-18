@@ -4,6 +4,7 @@
 #
 #   ・SAMPLE_INTERVAL 秒に 1 回だけ記録（statusLine は高頻度に呼ばれるため間引く）
 #   ・CREDITS_INTERVAL 秒に 1 回 月次クレジット枠を取得（デタッチ起動で非ブロッキング）
+#   ・CODEX_INTERVAL 秒に 1 回 Codex のレート枠をログから収集（同上）
 #   ・PLOT_INTERVAL 秒に 1 回 pace.json を再生成（デタッチ起動で非ブロッキング）
 #   ・rate_limits が両方 null のとき（API 応答前など）は記録しない
 # 依存: jq / python3
@@ -12,8 +13,10 @@ TP_DIR="${TOKEN_PACE_DIR:-$HOME/.claude/token-pace}"
 BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GEN="$BIN_DIR/pace-json.py"
 FETCH="$BIN_DIR/credits-fetch.py"
+CODEX="$BIN_DIR/codex-scan.py"
 SAMPLE_INTERVAL=30
 CREDITS_INTERVAL=300
+CODEX_INTERVAL=120
 PLOT_INTERVAL=180
 
 mkdir -p "$TP_DIR" 2>/dev/null
@@ -60,6 +63,18 @@ if (( _now - _clast >= CREDITS_INTERVAL )); then
     setsid python3 "$FETCH" >/dev/null 2>&1 </dev/null &
   else
     nohup  python3 "$FETCH" >/dev/null 2>&1 </dev/null &
+  fi
+fi
+
+# Codex のレート枠（statusLine 相当の hook が無いので rollout ログを増分で読む）
+_xlast=0; [[ -f "$TP_DIR/.last_codex" ]] && _xlast=$(<"$TP_DIR/.last_codex")
+[[ $_xlast =~ ^[0-9]+$ ]] || _xlast=0
+if (( _now - _xlast >= CODEX_INTERVAL )); then
+  printf '%s' "$_now" > "$TP_DIR/.last_codex"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid python3 "$CODEX" >/dev/null 2>&1 </dev/null &
+  else
+    nohup  python3 "$CODEX" >/dev/null 2>&1 </dev/null &
   fi
 fi
 

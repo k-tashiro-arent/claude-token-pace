@@ -36,9 +36,9 @@ fi
 # 2) ファイル配置
 mkdir -p "$TP_DIR/bin" "$CMD_DIR"
 cp "$SRC/bin/pace-json.py" "$SRC/bin/serve.sh" "$SRC/bin/sampler.sh" "$SRC/bin/serve-http.py" \
-   "$SRC/bin/credits-fetch.py" "$TP_DIR/bin/"
+   "$SRC/bin/credits-fetch.py" "$SRC/bin/codex-scan.py" "$TP_DIR/bin/"
 chmod +x "$TP_DIR/bin/serve.sh" "$TP_DIR/bin/sampler.sh" "$TP_DIR/bin/pace-json.py" \
-         "$TP_DIR/bin/serve-http.py" "$TP_DIR/bin/credits-fetch.py"
+         "$TP_DIR/bin/serve-http.py" "$TP_DIR/bin/credits-fetch.py" "$TP_DIR/bin/codex-scan.py"
 cp "$SRC/web/viewer.html" "$TP_DIR/index.html"   # / で開くため index.html として配信
 rm -f "$TP_DIR/viewer.html"                       # 旧名の残骸を掃除（アップグレード時）
 

@@ -87,6 +87,20 @@ Claude Code で:
 
 **注意**: このパネルの 100% は `monthly_limit`＝**支出上限**です。5h/7d の「使い切ってよい枠」とは意味が異なり、even pace ちょうど（灰色）は「月末に上限を使い切る軌道」を意味します。
 
+## Codex のレート枠（任意）
+
+[Codex CLI](https://github.com/openai/codex) を使っている環境では、その使用率も同じ画面に並べて表示できます。Codex には statusLine のような hook が無いため、**CLI 自身が書くセッションログを読みます**。
+
+- 読む対象: `$CODEX_HOME`（既定 `~/.codex`）`/sessions/**/rollout-*.jsonl` の `token_count` イベント。ここに応答時点のレート枠がそのまま入っています
+- 取り出すのは **`timestamp` と `rate_limits` の数値だけ**です。会話本文・ツール出力は読み取りもコピーもしません（`bin/codex-scan.py`）
+- 記録: `~/.claude/token-pace/codex.jsonl`（`{ts, u, w, r}` ＝ used% / 窓の長さ(分) / resets_at。secondary があれば `u2, w2, r2` を追加）
+- 収集は約 2 分に 1 回。読み込み済みバイト数を `.codex_scan.json` に持ち、**追記分だけ**を読みます（全走査は初回のみ・既定で 60 日前まで遡ります）
+- Codex が入っていない環境では何も記録されず、パネルも出ません
+
+窓の長さは定数ではなく `window_minutes` から決めるので、枠の構成（5h+7d の 2 枠 / 7d の 1 枠）が変わっても追従します。1 日以内の窓は 5h と同じ均等直線、それより長い窓は 7d と同じ就業時間の階段を標準ペースにします。
+
+**制限**: Codex 側のクレジット残高は `rate_limits.credits.balance` が常に `null` のため取得できません。月次パネルに相当するものは作れません。なお rollout ログは Codex CLI の内部形式で、バージョンによって変わり得ます（読めなくなればパネルを出しません）。
+
 ## 設定
 ### ポート（`~/.claude/token-pace/config.json`）
 ```json
@@ -103,7 +117,7 @@ Claude Code で:
 - `biz_start_hour` / `biz_end_hour`: 就業時刻（JST、小数可）
 
 ## データの場所
-`~/.claude/token-pace/`（`pace.jsonl` = 記録、`credits.jsonl` = 月次クレジット枠の記録、`pace.json` = ビューア入力、`index.html`、各種設定・状態ファイル）。`127.0.0.1` バインドなので LAN には露出しません。
+`~/.claude/token-pace/`（`pace.jsonl` = 記録、`credits.jsonl` = 月次クレジット枠、`codex.jsonl` = Codex のレート枠、`pace.json` = ビューア入力、`index.html`、各種設定・状態ファイル）。`127.0.0.1` バインドなので LAN には露出しません。
 
 ## アンインストール
 ```bash

@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 TP_DIR = os.path.expanduser(os.environ.get("TOKEN_PACE_DIR") or "~/.claude/token-pace")
 LOG = os.path.join(TP_DIR, "pace.jsonl")
 CREDITS_LOG = os.path.join(TP_DIR, "credits.jsonl")
+CODEX_LOG = os.path.join(TP_DIR, "codex.jsonl")
 JSON_OUT = os.path.join(TP_DIR, "pace.json")
 LOCK = os.path.join(TP_DIR, ".lock")
 BIZ_CONFIG = os.path.join(TP_DIR, "biz-hours.json")
@@ -38,6 +39,11 @@ JST_OFFSET = 9 * 3600  # JST=UTC+9 固定(DST無)
 FIVE_HOUR = 5 * 3600
 SEVEN_DAY = 7 * 86400
 PLAYBACK_SPAN = 7 * 86400   # プレイバック(早送り再生)で遡る既定の長さ=7d
+
+# Codex の resets_at は同じ窓でも数秒ゆらぐ（実測: 論理窓 31 個中 29 個・最大 15 秒）。
+# この許容内の値は同一窓として扱う。完全一致で絞ると窓が分裂し、最大値を現在窓に
+# 選んだ結果その窓の観測をほとんど捨ててしまう。
+CODEX_RESET_TOL = 60
 
 
 def load_biz_config():
@@ -377,6 +383,109 @@ def build_month_panel(crows, now_epoch):
     }
 
 
+def _win_label(minutes):
+    """窓の長さ(分)を 5h / 7d のような短いラベルにする。"""
+    m = int(minutes)
+    if m % 1440 == 0:
+        return f"{m // 1440}d"
+    if m % 60 == 0:
+        return f"{m // 60}h"
+    return f"{m}m"
+
+
+def _reset_buckets(values, tol=CODEX_RESET_TOL):
+    """近接する resets_at を論理窓ごとにまとめる（昇順のグループ列を返す）。"""
+    groups = []
+    for v in sorted(values):
+        if groups and v - groups[-1][-1] <= tol:
+            groups[-1].append(v)
+        else:
+            groups.append([v])
+    return groups
+
+
+def _codex_panel(rows, ukey, wkey, rkey, now_epoch):
+    """Codex の 1 枠ぶんのパネル。該当データが無ければ None。
+
+    窓の長さは定数ではなく観測値(window_minutes)から決める。Codex は 5h+7d の
+    2 枠だったり 7d の 1 枠だったりするため、枠の構成が変わっても追従できる。
+    used% は Claude 側と同様に包絡線化する（並行セッションの古い観測が混ざり、
+    同一 resets_at のまま数 pt 逆行する事象を実測している）。
+    """
+    resets = set()
+    for r in rows:
+        try:
+            resets.add(float(r.get(rkey)))
+        except (ValueError, TypeError):
+            continue
+    if not resets:
+        return None
+    cur = _reset_buckets(resets)[-1]        # 最新＝最大の論理窓
+    lo, hi = cur[0], cur[-1]
+    if hi <= now_epoch:
+        # 最新の観測窓が既に終わっている＝この枠の現在値は分からない。
+        # 枠の構成が変わって片方が消えた場合（Codex は 5h+7d → 7d に変わった実績が
+        # ある）、古い窓をそのまま描くと現在の枠として誤読されるのでパネルを出さない。
+        return None
+
+    pts, seen, mins = [], set(), {}
+    for r in rows:
+        ts, u, v, w = r.get("ts"), r.get(ukey), r.get(rkey), r.get(wkey)
+        if ts is None or u is None or v is None:
+            continue
+        try:
+            ts, u, v = float(ts), float(u), float(v)
+        except (ValueError, TypeError):
+            continue
+        if not (lo <= v <= hi):
+            continue
+        k = (ts, u, v)
+        if k in seen:
+            continue                        # 増分スキャン状態を失った際の重複を吸収
+        seen.add(k)
+        pts.append((ts, u))
+        if w is not None:
+            mins[w] = mins.get(w, 0) + 1
+    if not pts or not mins:
+        return None
+
+    wm = max(mins.items(), key=lambda kv: kv[1])[0]   # 窓長は最頻値を採用
+    r1 = hi
+    w1 = r1 - float(wm) * 60
+    pts.sort(key=lambda x: x[0])
+    ys = envelope([y for _, y in pts])
+    used = [[t, y] for (t, _), y in zip(pts, ys)]
+
+    if float(wm) * 60 <= 86400:             # 1 日以内の窓は 5h と同じく均等直線
+        even = [[w1, 0.0], [r1, 100.0]]
+        span = r1 - w1
+        std = max(0.0, min(100.0, (now_epoch - w1) / span * 100.0)) if span > 0 else 0.0
+        xmode = "time"
+    else:                                   # 長い窓は 7d と同じく就業時間の階段
+        bx, by = biz_baseline(w1, r1, step=1800 if r1 - w1 > SEVEN_DAY else 600)
+        even = [[x.timestamp(), y] for x, y in zip(bx, by)]
+        denom = bizsec(w1, r1)
+        std = max(0.0, min(100.0, bizsec(w1, now_epoch) / denom * 100.0)) if denom > 0 else 0.0
+        xmode = "date"
+
+    return {
+        "key": "codex " + _win_label(wm), "xmode": xmode,
+        "x0": w1, "x1": r1, "reset_label": _label(r1, xmode),
+        "used": used, "even": even,
+        "used_now": used[-1][1], "std_now": std,
+    }
+
+
+def build_codex_panels(rows, now_epoch):
+    """codex.jsonl から primary / secondary のパネルを作る（無い枠は出さない）。"""
+    panels = []
+    for ukey, wkey, rkey in (("u", "w", "r"), ("u2", "w2", "r2")):
+        p = _codex_panel(rows, ukey, wkey, rkey, now_epoch)
+        if p is not None:
+            panels.append(p)
+    return panels
+
+
 def _playback_segments(rows, start, now_epoch, key, val_key, reset_key, win_len, even_fn, xmode):
     """[start, now] に重なる各窓（観測された reset_key ごと）を古い順にセグメント化して返す。
 
@@ -445,20 +554,22 @@ def build_playback(rows, now_epoch):
     return {"start": start, "now": now_epoch, "seg5h": seg5h, "seg7d": seg7d}
 
 
-def write_json(rows, crows, now_epoch, reset5_epoch, reset7_epoch):
+def write_json(rows, crows, xrows, now_epoch, reset5_epoch, reset7_epoch):
     """pace.json をアトミック更新（tmp→replace、プロセス固有 tmp）。
 
     generated_at は最新サンプル ts（＝データのバージョン）。ブラウザはこの値の
     変化だけを見て再描画するので、内容が変わらない再生成では再描画しない。
-    クレジット側だけが更新された場合も再描画させるため、両ログの最大 ts を採る。
+    クレジット/Codex 側だけが更新された場合も再描画させるため、全ログの最大 ts を採る。
     """
-    gv, gc = latest_ts(rows), latest_ts(crows)
-    if gc is not None and (gv is None or gc > gv):
-        gv = gc
+    gv = None
+    for v in (latest_ts(rows), latest_ts(crows), latest_ts(xrows)):
+        if v is not None and (gv is None or v > gv):
+            gv = v
     panels = build_panels(rows, now_epoch, reset5_epoch, reset7_epoch)
     month = build_month_panel(crows, now_epoch)
     if month is not None:
         panels.append(month)     # credits.jsonl が無い環境では 5h/7d の 2 枚のまま
+    panels.extend(build_codex_panels(xrows, now_epoch))   # codex.jsonl が無ければ 0 枚
     data = {
         "generated_at": gv if gv is not None else now_epoch,
         "panels": panels,
@@ -496,12 +607,13 @@ def main():
     rows = read_rows()
     prune_if_needed(len(rows))
     crows = read_jsonl(CREDITS_LOG)         # 任意。無ければ月次パネルを出さない
+    xrows = read_jsonl(CODEX_LOG)           # 任意。無ければ Codex パネルを出さない
 
     now_epoch = datetime.now().timestamp()
     reset5_epoch = max_reset(rows, "h5r")   # 最大 ts 行ではなく最大 resets_at＝最新窓（後退防止）
     reset7_epoch = max_reset(rows, "d7r")
 
-    write_json(rows, crows, now_epoch, reset5_epoch, reset7_epoch)
+    write_json(rows, crows, xrows, now_epoch, reset5_epoch, reset7_epoch)
 
 
 if __name__ == "__main__":
