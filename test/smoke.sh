@@ -273,12 +273,12 @@ MDIR="$HOME/month-test"
 mkdir -p "$MDIR"
 python3 - "$MDIR/credits.jsonl" <<'PY'
 import json, sys
-from datetime import datetime
-now = datetime.now().timestamp()
-d = datetime.fromtimestamp(now)
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).timestamp()
+d = datetime.fromtimestamp(now, timezone.utc)
 y, m = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
-w1 = datetime(d.year, d.month, 1).timestamp()
-m1r = int(datetime(y, m, 1).timestamp())
+w1 = datetime(d.year, d.month, 1, tzinfo=timezone.utc).timestamp()   # 月境界は UTC
+m1r = int(datetime(y, m, 1, tzinfo=timezone.utc).timestamp())
 base = int(max(w1 + 1, now - 180))          # 必ず当月内・昇順になるように基準を取る
 rows = [
     {"ts": base,      "used": 0,     "limit": 0,      "m1r": m1r},   # 枠未割当 → 除外される
@@ -304,7 +304,12 @@ mspan="$(jq -r '((.panels[2].x1 - .panels[2].x0) / 86400) | floor' "$MDIR/pace.j
 { [ "$mspan" -ge 27 ] && [ "$mspan" -le 31 ]; } || fail "月次回帰: 窓幅が 1 か月でない ($mspan 日)"
 mpin="$(jq -r '((.panels[2].even | map(select(.[1] >= 99.9)) | length) * 100 / (.panels[2].even | length)) | floor' "$MDIR/pace.json")"
 [ "$mpin" -lt 25 ] || fail "月次回帰: even が早期に 100% へ張り付き（分母が週のまま）: 100% の点が ${mpin}%"
-ok "月次パネル: 3枚目=1mo・used_now=$mnow%・limit<=0 行を除外・even の飽和は ${mpin}% のみ"
+# 月境界は UTC。ローカル月初だと x0 が UTC 深夜 0 時ちょうどにならない（JST なら 15:00 UTC）。
+# 実測: 2026-09-01 00:00 JST を 8h40m 過ぎても used は $1000.19 のまま、00:00 UTC 直後に $0.00。
+jq -e '((.panels[2].x0 | floor) % 86400 == 0) and ((.panels[2].x1 | floor) % 86400 == 0)' \
+  "$MDIR/pace.json" >/dev/null \
+  || fail "月次回帰: 窓境界が UTC 月初でない (x0=$(jq -r '.panels[2].x0' "$MDIR/pace.json"))"
+ok "月次パネル: 3枚目=1mo・used_now=$mnow%・limit<=0 行を除外・even の飽和は ${mpin}% のみ・窓境界は UTC 月初"
 
 # 6) serve.sh が / と /pace.json を配信
 bash "$TP_DIR/bin/serve.sh" >/dev/null || fail "serve.sh が非ゼロ終了"

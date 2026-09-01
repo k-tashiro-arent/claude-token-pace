@@ -82,6 +82,7 @@ Claude Code で:
 - 取得: `GET https://api.anthropic.com/api/oauth/usage` を**約 5 分に 1 回**（`bin/credits-fetch.py`）
 - 認証: `~/.claude/.credentials.json`（`$CLAUDE_CONFIG_DIR` があればそちら）の OAuth アクセストークンを**読むだけ**。期限切れなら何もしません（トークンの更新は Claude Code 本体に任せます）
 - 記録: `~/.claude/token-pace/credits.jsonl`（`{ts, used, limit, m1r}`。金額は API の最小単位＝USD なら cent）
+- **リセットは UTC の月初**（日本時間では毎月 1 日 09:00）。API に月次枠の `resets_at` は無いため、この境界は実測に基づきます（2026-08-31 23:40 UTC に満額 → 2026-09-01 00:05 UTC に 0。ローカル月初の 09/01 00:00 JST を 8 時間 40 分過ぎた時点では未リセットでした）
 - 取得できない環境（トークンがファイルに無い macOS の Keychain 保管、extra usage 非対応プランなど）では**何も記録されず、パネルも表示されません**（5h/7d は従来どおり動作します）
 
 **注意**: このパネルの 100% は `monthly_limit`＝**支出上限**です。5h/7d の「使い切ってよい枠」とは意味が異なり、even pace ちょうど（灰色）は「月末に上限を使い切る軌道」を意味します。

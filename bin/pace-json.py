@@ -17,7 +17,7 @@ import json
 import math
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 TP_DIR = os.path.expanduser(os.environ.get("TOKEN_PACE_DIR") or "~/.claude/token-pace")
 LOG = os.path.join(TP_DIR, "pace.jsonl")
@@ -291,10 +291,17 @@ def build_panels(rows, now_epoch, reset5_epoch, reset7_epoch):
 
 
 def month_bounds(epoch):
-    """epoch を含む月の [1日00:00, 翌月1日00:00)(ローカル) を返す。"""
-    d = datetime.fromtimestamp(epoch)
+    """epoch を含む月の [1日00:00, 翌月1日00:00)(UTC) を返す。
+
+    月次クレジット枠のリセットは UTC の月初。ローカル月初ではない（実測:
+    2026-08-31 23:40:08 UTC に used=$1000.19 → 2026-09-01 00:05:16 UTC に $0.00。
+    ローカル月初の 2026-09-01 00:00 JST を 8 時間 40 分過ぎた時点では未リセットだった）。
+    API に月次枠の resets_at は無いため、境界はこの実測に基づく。
+    """
+    d = datetime.fromtimestamp(epoch, timezone.utc)
     y, m = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
-    return datetime(d.year, d.month, 1).timestamp(), datetime(y, m, 1).timestamp()
+    return (datetime(d.year, d.month, 1, tzinfo=timezone.utc).timestamp(),
+            datetime(y, m, 1, tzinfo=timezone.utc).timestamp())
 
 
 def compress_steps(pts):

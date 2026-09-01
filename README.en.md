@@ -82,6 +82,7 @@ Spend beyond your plan limits (usage credits) is **not present in the statusLine
 - Fetch: `GET https://api.anthropic.com/api/oauth/usage`, roughly **once every 5 minutes** (`bin/credits-fetch.py`)
 - Auth: **reads** the OAuth access token from `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`). If the token is expired it does nothing — refreshing is left to Claude Code itself
 - Storage: `~/.claude/token-pace/credits.jsonl` (`{ts, used, limit, m1r}`; amounts in the API's minor units, i.e. cents for USD)
+- **The allowance resets at the start of the month in UTC**, not local time. The API exposes no `resets_at` for this window, so the boundary comes from observation (full at 2026-08-31 23:40 UTC, zero at 2026-09-01 00:05 UTC; still un-reset 8h40m after the local month start)
 - Where this isn't available (macOS Keychain-stored credentials, plans without extra usage, …) **nothing is recorded and the panel is not shown** — 5h/7d keep working as before
 
 **Note**: 100% on this panel is `monthly_limit`, a **spend ceiling** — unlike the 5h/7d windows, which are allowances you are meant to consume. Sitting exactly on the even pace (gray) means you are on track to spend the entire ceiling.

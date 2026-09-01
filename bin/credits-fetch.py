@@ -19,7 +19,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 
 TP_DIR = os.path.expanduser(os.environ.get("TOKEN_PACE_DIR") or "~/.claude/token-pace")
 CFG_DIR = os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
@@ -75,10 +75,16 @@ def fetch_usage(token):
 
 
 def next_month_start(epoch):
-    """epoch を含む月の翌月 1 日 00:00(ローカル) の epoch。"""
-    d = datetime.fromtimestamp(epoch)
+    """epoch を含む月の翌月 1 日 00:00(UTC) の epoch。
+
+    月次クレジット枠のリセットは UTC の月初。ローカル月初ではない（実測:
+    2026-08-31 23:40:08 UTC に used=$1000.19 → 2026-09-01 00:05:16 UTC に $0.00。
+    ローカル月初の 2026-09-01 00:00 JST を 8 時間 40 分過ぎた時点では未リセットだった）。
+    API に月次枠の resets_at は無いため、境界はこの実測に基づく。
+    """
+    d = datetime.fromtimestamp(epoch, timezone.utc)
     y, m = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
-    return datetime(y, m, 1).timestamp()
+    return datetime(y, m, 1, tzinfo=timezone.utc).timestamp()
 
 
 def append_row(row):
