@@ -115,14 +115,20 @@
    if(100-e <= 0) return null;
    return (u-e)/(100-e)*100;
  }
- // pace(-100..0..+100)を色へ: -100=青 / 0=無彩色(灰) / +100=赤、中間は線形補間
+ // pace(-100..0..+100)を色へ: -100=マイナス側端点 / 0=無彩色(灰) / +100=赤、中間は線形補間
+ // マイナス側は Claude=青 / Codex=緑（どちらのツールの枠かを一目で分けるため）
  var NEUTRAL="rgb(142,142,142)";
+ var UNDER_BLUE=[24,110,255], UNDER_GREEN=[22,175,95];
  function lerp(a,b,f){ return Math.round(a+(b-a)*f); }
- function colorForPace(pd){
+ // パネルの key は pace-json.py の build_codex_panels が "codex " + 窓長 で作る
+ function underColor(p){
+   return (p && (p.key||"").indexOf("codex ")===0) ? UNDER_GREEN : UNDER_BLUE;
+ }
+ function colorForPace(pd, under){
    if(pd===null || pd===undefined) return NEUTRAL;
    var x = pd<-50?-50:(pd>50?50:pd);          // ±50% で飽和（外側は端点色のまま）
-   var BLUE=[24,110,255], GRAY=[142,142,142], RED=[225,80,80], a,b,f;
-   if(x<0){ a=BLUE; b=GRAY; f=(x+50)/50; } else { a=GRAY; b=RED; f=x/50; }
+   var GRAY=[142,142,142], RED=[225,80,80], a,b,f;
+   if(x<0){ a=under||UNDER_BLUE; b=GRAY; f=(x+50)/50; } else { a=GRAY; b=RED; f=x/50; }
    return "rgb("+lerp(a[0],b[0],f)+","+lerp(a[1],b[1],f)+","+lerp(a[2],b[2],f)+")";
  }
  // used の横グラデーション生成: 各点の pace を colFn で色化し停止点に。1点/幅0は色文字列を返す
@@ -170,7 +176,7 @@
      paceStr='<span class="mut">pace -</span>';
    } else {
      var sign=pd>=0?"+":"-";
-     paceStr='<span style="color:'+colorForPace(pd)+'">pace '+sign+Math.round(Math.abs(pd))+'%</span>';
+     paceStr='<span style="color:'+colorForPace(pd, underColor(p))+'">pace '+sign+Math.round(Math.abs(pd))+'%</span>';
    }
    h.innerHTML=p.key+' used '+p.used_now.toFixed(0)+'%'
      +' '+paceStr
@@ -232,9 +238,11 @@
      ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha=1;
    }
 
+   var uc=underColor(p);                              // マイナス側の端点色（Claude=青 / Codex=緑）
+   var colFn=function(pd){ return colorForPace(pd, uc); };
    var pu = pb ? revealUsed(p.used, nowT) : p.used;   // 再生中はカーソルまで
    if(pu && pu.length){
-     var grad=paceGradient(ctx, {used:pu, even:p.even}, X, colorForPace, NEUTRAL);   // 青-灰-赤（無彩色を挟む・不透明）
+     var grad=paceGradient(ctx, {used:pu, even:p.even}, X, colFn, NEUTRAL);   // 端点色-灰-赤（無彩色を挟む・不透明）
      ctx.beginPath(); ctx.moveTo(X(pu[0][0]), Y(0));
      pu.forEach(function(pt){ ctx.lineTo(X(pt[0]), Y(pt[1])); });
      ctx.lineTo(X(pu[pu.length-1][0]), Y(0)); ctx.closePath();
@@ -258,7 +266,7 @@
      ctx.strokeStyle=T().hover; ctx.globalAlpha=0.5; ctx.lineWidth=1; ctx.setLineDash([2,2]);
      ctx.beginPath(); ctx.moveTo(hx,MT); ctx.lineTo(hx,MT+ph); ctx.stroke();
      ctx.setLineDash([]); ctx.globalAlpha=1;
-     ctx.fillStyle=colorForPace(ev===null ? null : paceDev(np[1], ev));
+     ctx.fillStyle=colorForPace(ev===null ? null : paceDev(np[1], ev), uc);
      ctx.beginPath(); ctx.arc(hx,hy,3,0,Math.PI*2); ctx.fill();
      ctx.strokeStyle=T().dot; ctx.lineWidth=1; ctx.stroke();
      var s=fmt(np[0],p.xmode)+"<br>used <b>"+np[1].toFixed(1)+"%</b>";

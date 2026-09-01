@@ -428,6 +428,130 @@ jq -e '.panels[2].key == "codex 7d"' "$YDIR/pace.json" >/dev/null \
   || fail "codex期限切れ回帰: 現在窓(7d)のパネルが無い"
 ok "Codex: 終了済みの窓(5h)はパネル化せず、現在窓(7d)のみ残る"
 
+# 5w) 枠構成が戻ったとき、同じ列に残る古い枠を現在窓と取り違えない。
+#     Codex は 7d の 1 枠 → 5h+7d の 2 枠へ戻した実績があり（実測 2026-08-26 08:20）、
+#     このとき primary 列には 7d 時代の行が残る。その resets_at は現在の 5h 窓より
+#     未来にあるため、resets_at の最大で現在窓を選ぶと古い 7d が選ばれ、
+#     「codex 7d」が 2 枚出て現在の 5h が消える。最新の観測が属する窓を選ぶ。
+WDIR="$HOME/codex-refill-test"
+WHOME="$HOME/fake-codex-refill"
+mkdir -p "$WDIR" "$WHOME/sessions/2026/08/26"
+python3 - "$WHOME/sessions/2026/08/26/rollout-refill.jsonl" <<'PY'
+import json, sys, time
+now = int(time.time())
+old_r = now + 5 * 86400      # 7d 時代の残骸（まだ未来）
+cur_r = now + 3600           # 現在の 5h 窓
+sec_r = now + 6 * 86400      # 現在の 7d 窓
+def rec(dt, u, w, r, sec=None):
+    rl = {"limit_id": "codex",
+          "primary": {"used_percent": u, "window_minutes": w, "resets_at": r},
+          "secondary": None}
+    if sec:
+        rl["secondary"] = {"used_percent": sec[0], "window_minutes": sec[1], "resets_at": sec[2]}
+    return {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now + dt)),
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {}, "rate_limits": rl}}
+rows = [
+    rec(-30 * 3600, 50, 10080, old_r),                          # 30 時間前＝7d 時代の最後の観測
+    rec(-1200, 10, 300, cur_r, (28, 10080, sec_r)),             # 現在の 5h + 7d
+    rec(-600,  20, 300, cur_r, (30, 10080, sec_r)),
+]
+with open(sys.argv[1], "w") as f:
+    for r in rows:
+        f.write(json.dumps(r) + "\n")
+PY
+TOKEN_PACE_DIR="$WDIR" CODEX_HOME="$WHOME" python3 "$TP_DIR/bin/codex-scan.py" \
+  || fail "codex枠復活回帰: codex-scan.py が非ゼロ終了"
+TOKEN_PACE_DIR="$WDIR" python3 "$TP_DIR/bin/pace-json.py" \
+  || fail "codex枠復活回帰: pace-json.py が非ゼロ終了"
+jq -e '.panels | length == 4' "$WDIR/pace.json" >/dev/null \
+  || fail "codex枠復活回帰: panels が 4 でない (len=$(jq -r '.panels|length' "$WDIR/pace.json"))"
+jq -e '[.panels[2].key, .panels[3].key] | unique | length == 2' "$WDIR/pace.json" >/dev/null \
+  || fail "codex枠復活回帰: 同じ key のパネルが 2 枚出ている ($(jq -r '[.panels[2].key,.panels[3].key]|join(" / ")' "$WDIR/pace.json"))"
+jq -e '.panels[2].key == "codex 5h" and .panels[2].used_now == 20' "$WDIR/pace.json" >/dev/null \
+  || fail "codex枠復活回帰: 現在の 5h 枠が出ていない (got=$(jq -r '.panels[2].key' "$WDIR/pace.json") used=$(jq -r '.panels[2].used_now' "$WDIR/pace.json"))"
+jq -e '.panels[3].key == "codex 7d" and .panels[3].used_now == 30' "$WDIR/pace.json" >/dev/null \
+  || fail "codex枠復活回帰: 現在の 7d 枠が出ていない (got=$(jq -r '.panels[3].key' "$WDIR/pace.json"))"
+jq -e '[.panels[] | select(.used_now == 50)] | length == 0' "$WDIR/pace.json" >/dev/null \
+  || fail "codex枠復活回帰: 30 時間前の古い 7d 枠が現在窓として描かれている"
+ok "Codex: 5h 枠の復活時、同列に残る古い 7d を現在窓と取り違えない（codex 5h + codex 7d）"
+
+# 5z) Codex の app-server 経路(codex-fetch.py): 会話が無くても現在の枠が取れる。
+#     rollout に rate_limits が載るのは会話したときだけで、TUI の /status は
+#     app-server の account/rateLimits/read を叩いて結果をディスクに残さない。
+#     そのため会話しない期間は codex-scan.py では現在値が取れない。ここは同じ
+#     JSON-RPC を話す fake に CODEX_BIN を差し替えて検証する。
+ZDIR="$HOME/codex-fetch-test"
+FAKE_CODEX="$HOME/fake-codex-bin"
+mkdir -p "$ZDIR"
+cat > "$FAKE_CODEX" <<'PY'
+#!/usr/bin/env python3
+# `codex app-server` の代替。stdin の JSON-RPC に答えるだけ。
+import json, os, sys
+mode = os.environ.get("FAKE_MODE", "ok")
+WIN = {"usedPercent": 37, "windowDurationMins": 10080, "resetsAt": int(os.environ["FAKE_R"])}
+SEC = {"usedPercent": 12, "windowDurationMins": 300,   "resetsAt": int(os.environ["FAKE_R5"])}
+for line in sys.stdin:
+    try:
+        m = json.loads(line)
+    except ValueError:
+        continue
+    if m.get("id") == 1:
+        print(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"userAgent": "fake"}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "method": "configWarning",
+                          "params": {}}), flush=True)      # 通知が混ざっても読み飛ばせるか
+    elif m.get("id") == 2:
+        snap = {"limitId": "codex",
+                "primary":   None if mode == "null" else WIN,
+                "secondary": SEC if mode == "both" else None,
+                "planType": "team",
+                "rateLimitReachedType":
+                    "workspace_member_usage_limit_reached" if mode == "null" else None}
+        print(json.dumps({"jsonrpc": "2.0", "id": 2,
+                          "result": {"rateLimits": snap}}), flush=True)
+PY
+chmod +x "$FAKE_CODEX"
+_now="$(date +%s)"
+export FAKE_R=$(( _now + 3 * 86400 )) FAKE_R5=$(( _now + 3600 ))
+
+FAKE_MODE=both CODEX_BIN="$FAKE_CODEX" TOKEN_PACE_DIR="$ZDIR" \
+  python3 "$TP_DIR/bin/codex-fetch.py" || fail "codex-fetch: 非ゼロ終了"
+[ -f "$ZDIR/codex.jsonl" ] || fail "codex-fetch: codex.jsonl 未生成"
+zrows="$(wc -l < "$ZDIR/codex.jsonl" | tr -d '[:space:]')"
+[ "$zrows" = "1" ] || fail "codex-fetch: 1 行追記されていない (got=$zrows)"
+tail -1 "$ZDIR/codex.jsonl" | jq -e --argjson r "$FAKE_R" --argjson r5 "$FAKE_R5" \
+  '.u == 37 and .w == 10080 and .r == $r and .u2 == 12 and .w2 == 300 and .r2 == $r5 and (.ts | type) == "number"' \
+  >/dev/null || fail "codex-fetch: 追記内容が想定と違う ($(tail -1 "$ZDIR/codex.jsonl"))"
+
+# 枠到達で primary が null の期間は記録しない（codex-scan.py と同じ規律）
+FAKE_MODE=null CODEX_BIN="$FAKE_CODEX" TOKEN_PACE_DIR="$ZDIR" \
+  python3 "$TP_DIR/bin/codex-fetch.py" || fail "codex-fetch(primary=null): 非ゼロ終了"
+znull="$(wc -l < "$ZDIR/codex.jsonl" | tr -d '[:space:]')"
+[ "$znull" = "1" ] || fail "codex-fetch(primary=null): 行が増えた (got=$znull)"
+
+# codex が入っていない環境でも黙って何もしない
+CODEX_BIN="$HOME/no-such-codex" TOKEN_PACE_DIR="$ZDIR" \
+  python3 "$TP_DIR/bin/codex-fetch.py" || fail "codex-fetch(codex 不在): 非ゼロ終了"
+zmiss="$(wc -l < "$ZDIR/codex.jsonl" | tr -d '[:space:]')"
+[ "$zmiss" = "1" ] || fail "codex-fetch(codex 不在): 行が増えた (got=$zmiss)"
+
+# 同じ codex.jsonl を 2 つのプロセスが書くので、ロックは共有していなければならない
+# （別ロックだと _prune の read-all→replace 中の append で行が消える）
+grep -q '"\.codex\.lock"' "$TP_DIR/bin/codex-fetch.py" \
+  || fail "codex-fetch: ロックが .codex.lock でない"
+grep -q '"\.codex\.lock"' "$TP_DIR/bin/codex-scan.py" \
+  || fail "codex-scan: ロックが .codex.lock でない"
+
+TOKEN_PACE_DIR="$ZDIR" python3 "$TP_DIR/bin/pace-json.py" || fail "codex-fetch: pace-json.py が非ゼロ終了"
+jq -e '.panels | length == 4' "$ZDIR/pace.json" >/dev/null \
+  || fail "codex-fetch: panels が 4 でない (len=$(jq -r '.panels|length' "$ZDIR/pace.json"))"
+jq -e '.panels[2].key == "codex 7d" and .panels[2].used_now == 37 and (.panels[2].used | length) == 1' \
+  "$ZDIR/pace.json" >/dev/null || fail "codex-fetch: 1 点だけの codex 7d パネルにならない"
+jq -e '.panels[3].key == "codex 5h" and .panels[3].used_now == 12' "$ZDIR/pace.json" >/dev/null \
+  || fail "codex-fetch: secondary(5h) のパネルが出ていない"
+unset FAKE_R FAKE_R5
+ok "Codex(app-server): 会話なしで現在値を取得・通知を読み飛ばす・primary=null と codex 不在は無記録・ロック共有"
+
 # 6) serve.sh が / と /pace.json を配信
 bash "$TP_DIR/bin/serve.sh" >/dev/null || fail "serve.sh が非ゼロ終了"
 [ -r "$TP_DIR/.web_server" ] || fail ".web_server が記録されていない"

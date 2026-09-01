@@ -412,15 +412,27 @@ def _codex_panel(rows, ukey, wkey, rkey, now_epoch):
     used% は Claude 側と同様に包絡線化する（並行セッションの古い観測が混ざり、
     同一 resets_at のまま数 pt 逆行する事象を実測している）。
     """
-    resets = set()
+    # 現在窓は「最新の観測が属するバケット」で選ぶ。resets_at が最大のバケットでは
+    # ない点に注意：枠の構成が変わると、同じ列に残る古い枠の resets_at のほうが
+    # 未来にあることがある（実測: 08/26 に 7d → 5h+7d へ戻った際、primary 列に
+    # 残る 7d の resets_at 09/01 が、現在の 5h の 08/26 20:09 より先だった。最大で
+    # 選ぶと 21 時間前が最後の観測である古い 7d が現在窓になり、5h が消えた）。
+    resets, latest_ts, latest_reset = set(), None, None
     for r in rows:
         try:
-            resets.add(float(r.get(rkey)))
+            v = float(r.get(rkey))
         except (ValueError, TypeError):
             continue
-    if not resets:
+        resets.add(v)
+        try:
+            ts = float(r.get("ts"))
+        except (ValueError, TypeError):
+            continue
+        if latest_ts is None or ts > latest_ts:
+            latest_ts, latest_reset = ts, v
+    if latest_reset is None:
         return None
-    cur = _reset_buckets(resets)[-1]        # 最新＝最大の論理窓
+    cur = next(b for b in _reset_buckets(resets) if b[0] <= latest_reset <= b[-1])
     lo, hi = cur[0], cur[-1]
     if hi <= now_epoch:
         # 最新の観測窓が既に終わっている＝この枠の現在値は分からない。

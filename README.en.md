@@ -19,7 +19,7 @@ Top panel = 5h window (the 5 hours until the next 5h reset), bottom panel = 7d w
 ## Why
 - **Runs on your existing Claude subscription** — no API key, no extra cost. It just reads the rate-limit data Claude Code already has.
 - **Business-hours-aware pace** — the 7-day even pace follows your working hours (a staircase), not a flat line, so "am I burning too fast?" is actually meaningful.
-- **Local & private** — bound to `127.0.0.1` only; your usage data accumulates on your own machine and is never exposed to the LAN or anywhere else (the only outbound traffic is the read-only request that fetches the monthly panel — see [Monthly usage credits](#monthly-usage-credits-extra-usage)).
+- **Local & private** — bound to `127.0.0.1` only; your usage data accumulates on your own machine and is never exposed to the LAN or anywhere else. The only outbound traffic is the read-only requests that fetch the limits themselves: the monthly panel goes straight to the Anthropic API, and the Codex panel goes through `codex`'s own app-server — see [Monthly usage credits](#monthly-usage-credits-extra-usage) and [Codex rate limits](#codex-rate-limits-optional).
 
 ## Requirements
 - **OS**: Linux / macOS / WSL2 (**native Windows is not supported**)
@@ -89,17 +89,30 @@ Spend beyond your plan limits (usage credits) is **not present in the statusLine
 
 ## Codex rate limits (optional)
 
-If you also use the [Codex CLI](https://github.com/openai/codex), its usage can be shown in the same view. Codex has no statusLine-style hook, so this reads **the session logs the CLI itself writes**.
+If you also use the [Codex CLI](https://github.com/openai/codex), its usage can be shown in the same view. Codex has no statusLine-style hook, so it is collected through **two paths** (both write to the same `codex.jsonl`).
+
+**1. Ask the app-server (`bin/codex-fetch.py`)**
+
+- Sends `initialize` then `account/rateLimits/read` to `codex app-server` (JSON-RPC over stdio) and takes only the used% / window length / reset time from the reply
+- This is the same path the TUI's `/status` uses, so **the current values are available even when you haven't been talking to Codex**. No conversation happens, so no tokens are spent (about 1 second in practice)
+- Does nothing where `codex` isn't on PATH (`CODEX_BIN` overrides the path)
+
+**2. Read the rollout logs (`bin/codex-scan.py`)**
 
 - Source: `$CODEX_HOME` (default `~/.codex`) `/sessions/**/rollout-*.jsonl`, the `token_count` events — each carries the rate limits returned with that response
-- Only **`timestamp` and the `rate_limits` numbers** are extracted. Conversation content and tool output are never read or copied (`bin/codex-scan.py`)
+- Only **`timestamp` and the `rate_limits` numbers** are extracted. Conversation content and tool output are never read or copied
+- Bytes already read are tracked in `.codex_scan.json`, so only **appended data** is parsed (a full pass happens once, going back 60 days by default)
+- Limits are only attached when a conversation happens, so on its own this path goes stale while you aren't using Codex
+
+Common:
+
 - Storage: `~/.claude/token-pace/codex.jsonl` (`{ts, u, w, r}` = used% / window length in minutes / resets_at; `u2, w2, r2` added when a secondary limit exists)
-- Collected about once every 2 minutes. Bytes already read are tracked in `.codex_scan.json`, so only **appended data** is parsed (a full pass happens once, going back 60 days by default)
+- Both run about once every 2 minutes
 - Where Codex isn't installed, nothing is recorded and no panel is shown
 
-Window length comes from `window_minutes` rather than a constant, so it follows changes in the limit structure (5h+7d vs. 7d only). Windows of a day or less use the linear even pace (like 5h); longer windows use the business-hours staircase (like 7d).
+Window length comes from the observed window length rather than a constant, so it follows changes in the limit structure (5h+7d vs. 7d only). Windows of a day or less use the linear even pace (like 5h); longer windows use the business-hours staircase (like 7d).
 
-**Limitation**: the Codex credit balance cannot be obtained — `rate_limits.credits.balance` is always `null`. There is no equivalent of the monthly panel. Note also that the rollout log is Codex CLI's internal format and may change between versions (if it becomes unreadable, the panel is simply not shown).
+**Limitation**: the Codex credit balance cannot be obtained (`credits.balance` is always `null`). There is no equivalent of the monthly panel. Also, **while usage is at 0% the reset time keeps reporting "one window from now", so the window slides forward and the panel shows only the latest single point** (once usage begins the reset time pins down and points accumulate). When a limit is exhausted, the window numbers stop being returned at all and nothing is recorded meanwhile. Note also that both the rollout log and the app-server protocol are Codex CLI internals and may change between versions (if they become unreadable, the panel is simply not shown).
 
 ## Configuration
 ### Port (`~/.claude/token-pace/config.json`)
