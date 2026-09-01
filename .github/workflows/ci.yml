@@ -23,9 +23,11 @@ jobs:
             bash -n "$f"
           done
 
-  # 5) Python lint（pace-json.py）
+  # 5) Python lint（bin/ 配下すべて）
+  #    ruff はバージョンを固定する。未固定だと既定ルールの変更だけで
+  #    （コードを変えていないのに）CI が赤くなる。検査対象は ruff.toml で固定。
   python-lint:
-    name: python lint (pace-json.py)
+    name: python lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,11 +35,11 @@ jobs:
         with:
           python-version: '3.x'
       - name: py_compile
-        run: python -m py_compile bin/pace-json.py bin/serve-http.py
+        run: python -m py_compile bin/*.py
       - name: ruff
         run: |
-          python -m pip install --quiet ruff
-          ruff check bin/pace-json.py bin/serve-http.py
+          python -m pip install --quiet 'ruff==0.16.4'
+          ruff check bin/
 
   # 1) インストール一気通貫スモークテスト
   # 2) ubuntu + macOS マトリクス、かつ install.sh 直叩き(direct) と
