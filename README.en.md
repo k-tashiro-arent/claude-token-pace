@@ -10,11 +10,11 @@ An interactive, browser-based viewer for your Claude Code **token consumption pa
 
 ![Token consumption pace viewer](docs/token-pace.gif)
 
-- **used line**: rate-limit usage (%). Colored by pace deviation: blue (behind) → gray (on pace) → red (ahead).
+- **used line**: rate-limit usage (%). Colored by pace deviation: blue (behind) → gray (on pace) → red (ahead). **On Codex panels the behind end is green instead of blue**, so the two tools' windows are easy to tell apart.
 - **even pace (dotted)**: the standard consumption pace. Linear for 5h, a business-hours staircase for 7d.
 - **now line**: current time (updated every second). Hover to read used / even / pace deviation at any point.
 
-Top panel = 5h window (the 5 hours until the next 5h reset), bottom panel = 7d window (the 7 days until the next 7d reset). **On accounts with a monthly usage-credit allowance (extra usage), a third panel** (until the next month-start reset) is shown as well.
+From the top: the **5h window** (the 5 hours until the next 5h reset) and the **7d window** (the 7 days until the next 7d reset). More panels appear depending on your setup — **`1mo`** (until the next month-start reset) on accounts with a monthly usage-credit allowance (extra usage, see [Monthly usage credits](#monthly-usage-credits-extra-usage)), and **the Codex CLI's own windows** (`codex 5h`, `codex 7d`, …) when Codex is installed — following whatever window structure Codex reports (see [Codex rate limits](#codex-rate-limits-optional)).
 
 ## Why
 - **Runs on your existing Claude subscription** — no API key, no extra cost. It just reads the rate-limit data Claude Code already has.
