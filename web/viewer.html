@@ -13,11 +13,11 @@
  header{display:flex;justify-content:space-between;align-items:center;
    font-size:12px;color:var(--mut);padding:2px 4px 4px;}
  header .right{display:flex;align-items:center;gap:8px;}
- #theme,#play{background:transparent;border:1px solid var(--btnbd);color:var(--fg);
+ #theme,#play,#align{background:transparent;border:1px solid var(--btnbd);color:var(--fg);
    border-radius:4px;font-size:12px;line-height:1;padding:2px 7px;cursor:pointer;}
- #theme:hover,#play:hover{background:var(--tipbg);}
- #play:disabled{opacity:.4;cursor:default;}
- #play:disabled:hover{background:transparent;}
+ #theme:hover,#play:hover,#align:hover{background:var(--tipbg);}
+ #play:disabled,#align:disabled{opacity:.4;cursor:default;}
+ #play:disabled:hover,#align:disabled:hover{background:transparent;}
  .panels{flex:1;display:flex;flex-direction:column;min-height:0;}
  .panel{flex:1;display:flex;flex-direction:column;min-height:0;}
  .phead{position:absolute;top:10px;left:44px;z-index:3;pointer-events:none;
@@ -31,7 +31,7 @@
    font-variant-numeric:tabular-nums;z-index:5;}
 </style></head>
 <body><div class="wrap">
- <header><span class="right"><span id="ts">loading…</span><button id="play" title="直近7dを早送り再生" disabled>▶</button><button id="theme" title="テーマ切替">◐</button></span></header>
+ <header><span class="right"><span id="ts">loading…</span><button id="theme" title="テーマ切替">◐</button><button id="play" title="直近7dを早送り再生" disabled>▶</button><button id="align" title="全パネルを共通の時間軸（直近1か月）に揃える">Align</button></span></header>
  <div class="panels" id="panels"></div>
 </div>
 <script>
@@ -44,6 +44,7 @@
  };
  var ML=40, MR=8, MT=6, MB=18, MAX_TICKS=12;
  var data=null, lastGen=null, hover=[], theme="dark", panelCount=0;
+ var alignMode=false;         // 全パネルを共通の時間軸（既定 直近1か月）に揃えるモード
  var pb=null;                 // プレイバック中の状態 {t:仮想now(epoch秒), seg5h:[…], seg7d:[…], raf:id}
  var PB_DURATION=6000;        // 早送り全体の所要(ms)
  function T(){ return THEMES[theme]||THEMES.dark; }
@@ -57,17 +58,18 @@
  }
  function xlab(epoch, mode){ var d=new Date(epoch*1000); return mode==="date"? md(d) : hm(d); }
 
- function interp(arr, t){
+ function interp(arr, t, col){
+   var c=col||1;
    if(!arr||!arr.length) return null;
-   if(t<=arr[0][0]) return arr[0][1];
-   if(t>=arr[arr.length-1][0]) return arr[arr.length-1][1];
+   if(t<=arr[0][0]) return arr[0][c];
+   if(t>=arr[arr.length-1][0]) return arr[arr.length-1][c];
    for(var i=1;i<arr.length;i++){
      if(t<=arr[i][0]){
        var a=arr[i-1], b=arr[i], s=b[0]-a[0];
-       return s<=0 ? b[1] : a[1]+(b[1]-a[1])*(t-a[0])/s;
+       return s<=0 ? b[c] : a[c]+(b[c]-a[c])*(t-a[0])/s;
      }
    }
-   return arr[arr.length-1][1];
+   return arr[arr.length-1][c];
  }
  function nearest(arr, t){
    if(!arr||!arr.length) return null;
@@ -83,7 +85,14 @@
    var out=[];
    for(var i=0;i<used.length && used[i][0]<=t;i++) out.push(used[i]);
    var y=interp(used, t);
-   if(y!==null) out.push([t, y]);
+   if(y!==null){
+     var pt=[t, y];
+     if(used[0].length>2){                       // 履歴の点は [ts, used, even]
+       var e=interp(used, t, 2);
+       if(e!==null) pt.push(e);
+     }
+     out.push(pt);
+   }
    return out;
  }
  // 仮想 now=t で表示すべき 5h セグメントを選ぶ（窓内→そのまま / 窓を過ぎた→直近の過去窓 / 開始前→最古）
@@ -135,8 +144,9 @@
  function paceGradient(ctx, p, X, colFn, empty){
    var u=p.used; if(!u || !u.length) return empty;
    function colAt(i){
-     var ev=(p.even && p.even.length)?interp(p.even, u[i][0]):null;
-     return colFn(ev===null ? null : paceDev(u[i][1], ev));
+     // 履歴モードの点は [ts, used, even] の 3 要素。窓ごとに even が違うので点が自分で持つ
+     var ev=(u[i].length>2) ? u[i][2] : ((p.even && p.even.length)?interp(p.even, u[i][0]):null);
+     return colFn((ev===null||ev===undefined) ? null : paceDev(u[i][1], ev));
    }
    var xa=X(u[0][0]), xb=X(u[u.length-1][0]);
    if(!(xb>xa)) return colAt(u.length-1);
@@ -146,6 +156,46 @@
      g.addColorStop(f, colAt(i));
    }
    return g;
+ }
+
+ // 使用量が下がる箇所は空白として扱い、線もフィルもつながない（両モード共通）。
+ // used% は窓ごとに包絡（単調非減少）してあるので、下降が起きるのは窓の切り替わりか
+ // 窓内リセットだけ。どちらも連続した消費ではないので、つないで描くと存在しない
+ // 下降に見える。標準ペース線も窓内では単調増加なので、同じ規則で切れる。
+ // 区間を描画範囲 [x0,x1] に切り詰める（両端は補間点を足して線を軸まで届かせる）。
+ // Hist はデータを表示幅の倍（既定 60 日）持つので、切らないと軸の外に描いてしまう。
+ function clipRun(run, x0, x1){
+   var out=[], i, a, b, y, e;
+   function at(p0, p1, t){          // p0-p1 間の t 時点。even(3要素目) も引き継ぐ
+     var q=[t, interp([p0,p1], t)];
+     if(p0.length>2 && p1.length>2){ e=interp([p0,p1], t, 2); if(e!==null) q.push(e); }
+     return q;
+   }
+   for(i=0;i<run.length;i++){
+     b=run[i];
+     if(b[0]<x0){ continue; }
+     if(b[0]>x1){
+       if(out.length && i>0){ y=at(run[i-1], b, x1); if(y[1]!==null) out.push(y); }
+       break;
+     }
+     if(!out.length && i>0 && run[i-1][0]<x0){    // 左端へ届かせる
+       y=at(run[i-1], b, x0); if(y[1]!==null) out.push(y);
+     }
+     out.push(b);
+   }
+   return out;
+ }
+ function splitRuns(u){
+   var runs=[], cur=[];
+   for(var i=0;i<u.length;i++){
+     if(i>0 && u[i][1]<u[i-1][1]){
+       if(cur.length) runs.push(cur);
+       cur=[];
+     }
+     cur.push(u[i]);
+   }
+   if(cur.length) runs.push(cur);
+   return runs;
  }
 
  // パネル DOM をデータのパネル数に合わせて作り直す（5h/7d の 2 枚、月次があれば 3 枚）
@@ -165,8 +215,31 @@
    for(var k=0;k<n;k++) bindHover(k);
  }
 
+// Align モードのビュー: 系列を履歴(hist)に、軸を全パネル共通の [hist_x0, hist_x1] に差し替える。
+ // ヘッダ（used_now / std_now / reset）は現在窓のままにする。
+ // 標準ペース線は、30 日でも窓が少なく読める枠（7d / 1mo）だけ hist_even を持つ。
+ function viewOf(p){
+   if(!alignMode || !p || !p.hist || !p.hist.length) return p;
+   if(!data || data.hist_x0===undefined || data.hist_x1===undefined) return p;
+   // 通常は直近 30 日。再生中は同じ幅の窓が、右端＝再生カーソルとして滑る
+   // （データが 60 日ぶんあれば、開始時の窓は 60 日前〜30 日前）。
+   var x0=data.hist_x0, x1=data.hist_x1;
+   if(pb && pb.align){ x1=pb.t; x0=pb.slide ? (pb.t-pb.width) : data.hist_x0; }
+   return { key:p.key, xmode:"date", x0:x0, x1:x1,
+            reset_label:p.reset_label, used:p.hist, even:(p.hist_even||[]),
+            used_now:p.used_now, std_now:p.std_now };
+ }
+ function alignAvailable(){
+   return !!(data && data.hist_x0!==undefined
+             && data.panels.some(function(p){ return p.hist && p.hist.length; }));
+ }
+
  function setHeader(idx, p){
    var h=document.getElementById("h"+idx);
+   if(alignMode && p.hist && p.hist.length){
+     h.innerHTML=p.key;      // 履歴モードは枠の名前だけ（used/pace/reset は現在窓の話なので出さない）
+     return;
+   }
    if(p.used_now===null || p.used_now===undefined){
      h.innerHTML=p.key+' <span class="mut">データ収集中…</span>';
      return;
@@ -195,6 +268,7 @@
    if(pb){ nowT=pb.t; p=pbActive(idx, pb.t); }
    else { nowT=Date.now()/1000; p = data && data.panels[idx]; }
    if(!p) return;
+   p = viewOf(p);
 
    var pw=cssW-ML-MR, ph=cssH-MT-MB;
    if(pw<10||ph<10) return;
@@ -233,9 +307,14 @@
 
    if(p.even && p.even.length){
      ctx.strokeStyle=T().label; ctx.globalAlpha=0.8; ctx.lineWidth=1.3; ctx.setLineDash([2,3]);
-     ctx.beginPath();
-     p.even.forEach(function(pt,i){ var xx=X(pt[0]),yy=Y(pt[1]); i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy); });
-     ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha=1;
+     splitRuns(p.even).map(function(run){ return clipRun(run, x0, x1); })
+       .filter(function(run){ return run.length; })
+       .forEach(function(run){                        // 窓の切り替わりでは繋がない
+       ctx.beginPath();
+       run.forEach(function(pt,i){ var xx=X(pt[0]),yy=Y(pt[1]); i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy); });
+       ctx.stroke();
+     });
+     ctx.setLineDash([]); ctx.globalAlpha=1;
    }
 
    var uc=underColor(p);                              // マイナス側の端点色（Claude=青 / Codex=緑）
@@ -243,13 +322,17 @@
    var pu = pb ? revealUsed(p.used, nowT) : p.used;   // 再生中はカーソルまで
    if(pu && pu.length){
      var grad=paceGradient(ctx, {used:pu, even:p.even}, X, colFn, NEUTRAL);   // 端点色-灰-赤（無彩色を挟む・不透明）
-     ctx.beginPath(); ctx.moveTo(X(pu[0][0]), Y(0));
-     pu.forEach(function(pt){ ctx.lineTo(X(pt[0]), Y(pt[1])); });
-     ctx.lineTo(X(pu[pu.length-1][0]), Y(0)); ctx.closePath();
-     ctx.fillStyle=grad; ctx.globalAlpha=0.18; ctx.fill(); ctx.globalAlpha=1;   // フィルは一律18%
-     ctx.strokeStyle=grad; ctx.lineWidth=1.8; ctx.beginPath();
-     pu.forEach(function(pt,i){ var xx=X(pt[0]),yy=Y(pt[1]); i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy); });
-     ctx.stroke();
+     ctx.fillStyle=grad; ctx.strokeStyle=grad; ctx.lineWidth=1.8;
+     splitRuns(pu).map(function(run){ return clipRun(run, x0, x1); })
+       .filter(function(run){ return run.length; }).forEach(function(run){
+       ctx.beginPath(); ctx.moveTo(X(run[0][0]), Y(0));
+       run.forEach(function(pt){ ctx.lineTo(X(pt[0]), Y(pt[1])); });
+       ctx.lineTo(X(run[run.length-1][0]), Y(0)); ctx.closePath();
+       ctx.globalAlpha=0.18; ctx.fill(); ctx.globalAlpha=1;                    // フィルは一律18%
+       ctx.beginPath();
+       run.forEach(function(pt,i){ var xx=X(pt[0]),yy=Y(pt[1]); i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy); });
+       ctx.stroke();
+     });
    }
 
    if(nowT>=x0 && nowT<=x1){
@@ -261,7 +344,8 @@
 
    var tip=document.getElementById("t"+idx), ht=hover[idx];
    if(!pb && ht!==null && ht>=x0 && ht<=x1 && p.used && p.used.length){
-     var np=nearest(p.used, ht), ev=interp(p.even, np[0]);
+     var np=nearest(p.used, ht);
+     var ev=(np.length>2) ? np[2] : interp(p.even, np[0]);
      var hx=X(np[0]), hy=Y(np[1]);
      ctx.strokeStyle=T().hover; ctx.globalAlpha=0.5; ctx.lineWidth=1; ctx.setLineDash([2,2]);
      ctx.beginPath(); ctx.moveTo(hx,MT); ctx.lineTo(hx,MT+ph); ctx.stroke();
@@ -289,12 +373,15 @@
    drawAll();
    document.getElementById("ts").textContent="updated "+hm(new Date());
    var pbd=j.playback;
-   document.getElementById("play").disabled =
-     !(pbd && ((pbd.seg5h&&pbd.seg5h.length)||(pbd.seg7d&&pbd.seg7d.length)));
+   document.getElementById("play").disabled = alignMode
+     ? !alignAvailable()
+     : !(pbd && ((pbd.seg5h&&pbd.seg5h.length)||(pbd.seg7d&&pbd.seg7d.length)));
+   applyAlignButton();
  }
 
  // ---- プレイバック（直近7d早送り。各パネルの窓リセットも再現） ----
  function pbActive(idx, t){             // 仮想now=t で表示するセグメント（無ければライブパネルへ縮退）
+   if(pb.align) return data && data.panels[idx];   // Hist は軸固定。viewOf が履歴系列へ差し替える
    var segs=(idx===0)?pb.seg5h:(idx===1?pb.seg7d:null);   // 月次パネルは再生対象外＝ライブのまま
    return (segs && segs.length) ? pbSegAt(segs, t) : (data && data.panels[idx]);
  }
@@ -306,21 +393,38 @@
  }
  function startPlayback(){
    if(pb) return;
-   var pbd=data && data.playback;
-   var has5=pbd && pbd.seg5h && pbd.seg5h.length, has7=pbd && pbd.seg7d && pbd.seg7d.length;
-   if(!has5 && !has7) return;
-   var start=pbd.start, end=Math.max(pbd.now, Date.now()/1000);
+   var pbd=data && data.playback, start, end, align=alignMode && alignAvailable();
+   var width=0, slide=false;
+   if(align){
+     // 表示幅（既定 30 日）の窓を、データの左端（既定 60 日前・記録が短ければ最古）から
+     // 滑らせる。データが表示幅ぶんしか無いときは滑らせようがないので、そのときは
+     // 左端据え置きで右端だけ伸ばす。
+     width=data.hist_x1-data.hist_x0;
+     var lo=(data.hist_lo!==undefined)?data.hist_lo:data.hist_x0;
+     slide=(lo+width)<data.hist_x1;
+     start=slide ? (lo+width) : data.hist_x0;
+     end=data.hist_x1;
+   } else {
+     var has5=pbd && pbd.seg5h && pbd.seg5h.length, has7=pbd && pbd.seg7d && pbd.seg7d.length;
+     if(!has5 && !has7) return;
+     start=pbd.start; end=Math.max(pbd.now, Date.now()/1000);
+   }
    if(!(end>start)) return;
    document.getElementById("play").disabled=true;
    document.getElementById("ts").textContent="▶ playback";
-   pb={ t:start, seg5h:pbd.seg5h||[], seg7d:pbd.seg7d||[], raf:0 };
+   pb={ t:start, align:align, width:width, slide:slide,
+        seg5h:(pbd&&pbd.seg5h)||[], seg7d:(pbd&&pbd.seg7d)||[], raf:0 };
    var t0=performance.now();
    function frame(){
      var f=(performance.now()-t0)/PB_DURATION; if(f>1) f=1;
      pb.t=start+(end-start)*f;
      for(var i=0;i<panelCount;i++){
-       var ap=pbActive(i, pb.t);
-       if(ap) setHeader(i, pbHeader(i, ap, pb.t));
+       if(pb.align){
+         setHeader(i, data.panels[i]);        // Hist のヘッダは枠の名前だけ
+       } else {
+         var ap=pbActive(i, pb.t);
+         if(ap) setHeader(i, pbHeader(i, ap, pb.t));
+       }
        draw(i);
      }
      if(f<1){ pb.raf=requestAnimationFrame(frame); } else { endPlayback(); }
@@ -346,6 +450,7 @@
    cv.addEventListener("mousemove", function(e){
      if(pb) return;
      var p=data&&data.panels[idx]; if(!p) return;
+     p = viewOf(p);
      var rect=cv.getBoundingClientRect(), mx=e.clientX-rect.left, pw=cv.clientWidth-ML-MR;
      if(mx<ML || mx>ML+pw){ hover[idx]=null; draw(idx); return; }
      hover[idx]=p.x0 + (mx-ML)/pw*(p.x1-p.x0); draw(idx);
@@ -371,6 +476,26 @@
    try{ localStorage.setItem("tp-theme", theme); }catch(e){}
    applyTheme();
  });
+// 履歴モードの切り替え（テーマと同じく記憶する）
+ function applyAlignButton(){
+   var b=document.getElementById("align");
+   b.disabled = !alignAvailable();
+   b.style.opacity = alignMode ? "1" : "";
+   b.style.borderColor = alignMode ? "var(--fg)" : "";
+   b.title = alignMode ? "各枠の窓ごとの表示へ戻す" : "全パネルを共通の時間軸（直近1か月）に揃える";
+ }
+ document.getElementById("align").addEventListener("click", function(){
+   if(pb) return;                       // 再生中は切り替えない
+   alignMode = !alignMode;
+   try{ localStorage.setItem("tp-align", alignMode ? "1" : "0"); }catch(e){}
+   if(data) apply(data);                // ヘッダ・▶ の状態も含めて描き直す
+   else applyAlignButton();
+ });
+ (function initAlign(){
+   var v=null; try{ v=localStorage.getItem("tp-align"); }catch(e){}
+   alignMode = (v==="1");
+   applyAlignButton();
+ })();
  document.getElementById("play").addEventListener("click", startPlayback);
 
  window.addEventListener("resize", drawAll);

@@ -552,6 +552,114 @@ jq -e '.panels[3].key == "codex 5h" and .panels[3].used_now == 12' "$ZDIR/pace.j
 unset FAKE_R FAKE_R5
 ok "Codex(app-server): 会話なしで現在値を取得・通知を読み飛ばす・primary=null と codex 不在は無記録・ロック共有"
 
+# 5h2) 履歴モードの系列: 全パネル共通の時間軸（既定は直近 1 か月。データがそれより
+#      短ければ最古の記録まで）に、過去の窓も含めた used% を並べる。窓ごとに
+#      envelope するので窓の境界で値が戻る鋸歯になる（通しで running-max すると
+#      どの窓のピークも引きずって 100% の平線になってしまう）。stale 行は現在窓と
+#      同じく除外する。
+HDIR="$HOME/hist-test"
+mkdir -p "$HDIR"
+python3 - "$HDIR/pace.jsonl" <<'PY'
+import json, sys, time
+now = int(time.time())
+rows = []
+# 3 つの 5h 窓。各窓で値が上がり、次の窓は低値から再開する（＝境界で戻る）
+# ts は必ず now 以前かつ h5r より前（h5r <= ts の行は stale として捨てられるため）
+for k, (reset, pts) in enumerate([
+        (now - 6 * 3600, [(-9 * 3600, 10), (-8 * 3600, 50), (-7 * 3600, 90)]),   # 2 つ前の窓
+        (now - 1 * 3600, [(-4 * 3600, 5), (-3 * 3600, 40), (-2 * 3600, 70)]),    # 1 つ前の窓
+        (now + 4 * 3600, [(-2400, 3), (-1200, 20)])]):                           # 現在の窓
+    for dt, v in pts:
+        rows.append({"ts": now + dt, "h5": v, "h5r": reset,
+                     "d7": v, "d7r": now + 3 * 86400, "cost": 1.0, "sid": f"w{k}"})
+# stale: 観測時点で既に過ぎた 5h リセットを持つ行（履歴でも捨てられること）
+rows.append({"ts": now - 1800, "h5": 99, "h5r": now - 2 * 3600,
+             "d7": 99, "d7r": now + 3 * 86400, "cost": 1.0, "sid": "stale"})
+rows.sort(key=lambda r: r["ts"])
+with open(sys.argv[1], "w") as f:
+    for r in rows:
+        f.write(json.dumps(r) + "\n")
+PY
+TOKEN_PACE_DIR="$HDIR" python3 "$TP_DIR/bin/pace-json.py" || fail "履歴回帰: pace-json.py が非ゼロ終了"
+jq -e 'has("hist_x0") and has("hist_x1")' "$HDIR/pace.json" >/dev/null \
+  || fail "履歴回帰: hist_x0 / hist_x1 が出ていない"
+# 1 か月に満たないので左端は最古の記録
+hx0="$(jq -r '.panels[0].hist[0][0]' "$HDIR/pace.json")"
+jq -e --argjson t "$hx0" '.hist_x0 <= $t' "$HDIR/pace.json" >/dev/null \
+  || fail "履歴回帰: hist_x0 が最古の記録より後ろ"
+jq -e '.hist_x1 - .hist_x0 < 2*86400' "$HDIR/pace.json" >/dev/null \
+  || fail "履歴回帰: データが 1 日ぶんしか無いのに軸が 2 日以上ある（最古へ寄せていない）"
+jq -e '(.panels[0].hist | length) >= 6' "$HDIR/pace.json" >/dev/null \
+  || fail "履歴回帰: 5h の履歴が短すぎる (len=$(jq -r '.panels[0].hist|length' "$HDIR/pace.json"))"
+# 窓の境界で値が戻る＝下降が 2 回以上ある（通しで包絡すると 0 回になる）
+drops="$(python3 - "$HDIR/pace.json" <<'PY'
+import json, sys
+h = json.load(open(sys.argv[1]))["panels"][0]["hist"]
+print(sum(1 for i in range(1, len(h)) if h[i][1] < h[i-1][1]))
+PY
+)"
+[ "$drops" -ge 2 ] || fail "履歴回帰: 窓の境界で値が戻っていない（下降 $drops 回、期待 2 回以上）"
+jq -e '[.panels[0].hist[] | select(.[1] == 99)] | length == 0' "$HDIR/pace.json" >/dev/null \
+  || fail "履歴回帰: stale 行(99%)が履歴に混入した"
+jq -e '(.panels[0].hist | map(.[1]) | max) == 90' "$HDIR/pace.json" >/dev/null \
+  || fail "履歴回帰: 5h 履歴の最大が 90 でない (got=$(jq -r '.panels[0].hist|map(.[1])|max' "$HDIR/pace.json"))"
+jq -e '(.panels[1].hist | length) > 0' "$HDIR/pace.json" >/dev/null \
+  || fail "履歴回帰: 7d の履歴が空"
+# 現在窓の系列（used）は履歴を入れても変わらない
+jq -e '.panels[0].used_now == 20 and (.panels[0].used | length) == 2' "$HDIR/pace.json" >/dev/null \
+  || fail "履歴回帰: 現在窓の系列が壊れた (used_now=$(jq -r '.panels[0].used_now' "$HDIR/pace.json"))"
+ok "履歴モード: 共通軸(最古まで)・窓ごとに包絡し境界で戻る(下降 $drops 回)・stale 除外・現在窓は不変"
+
+# 5v) 履歴の異常パターン除去: 「窓が後戻りする行」と「h5r を持たない行」を弾く。
+#     どちらも別セッションが持っていた古いスナップショットで、包絡の running-max が
+#     跳ね返って 100→0→100 のような形になる。実測で両方とも発生している
+#     （08/19 15:00 の 7d リセット直後に前の窓の 98% / 09/02 08:51 に h5r 欠落の 100%）。
+VDIR="$HOME/hist-anomaly-test"
+mkdir -p "$VDIR"
+python3 - "$VDIR/pace.jsonl" <<'PY'
+import json, sys, time
+now = int(time.time())
+old_r, new_r = now - 3600, now + 6 * 86400      # 前の 7d 窓 / 現在の 7d 窓
+h5r = now + 3600                                # 5h リセットは常に未来（stale 判定を通す）
+rows = [
+    {"ts": now - 5 * 3600, "h5": 10, "h5r": h5r, "d7": 90, "d7r": old_r},
+    {"ts": now - 4 * 3600, "h5": 11, "h5r": h5r, "d7": 90, "d7r": old_r},
+    {"ts": now - 1800,     "h5": 12, "h5r": h5r, "d7":  5, "d7r": new_r},
+    {"ts": now - 1200,     "h5": 13, "h5r": h5r, "d7":  6, "d7r": new_r},
+    # 新しい窓を見たあとで前の窓を報告する行（別セッションの古いスナップショット）
+    {"ts": now - 900,      "h5": 14, "h5r": h5r, "d7": 90, "d7r": old_r},
+    {"ts": now - 600,      "h5": 15, "h5r": h5r, "d7":  7, "d7r": new_r},
+    # h5r を持たない行（statusLine に five_hour ブロックが無い応答）
+    {"ts": now - 300,      "h5": None, "h5r": None, "d7": 99, "d7r": new_r},
+    {"ts": now - 60,       "h5": 16, "h5r": h5r, "d7":  8, "d7r": new_r},
+]
+with open(sys.argv[1], "w") as f:
+    for r in rows:
+        f.write(json.dumps(r) + "\n")
+PY
+TOKEN_PACE_DIR="$VDIR" python3 "$TP_DIR/bin/pace-json.py" || fail "履歴異常回帰: pace-json.py が非ゼロ終了"
+jq -e '[.panels[1].hist[] | select(.[1] == 99)] | length == 0' "$VDIR/pace.json" >/dev/null \
+  || fail "履歴異常回帰: h5r を持たない行(99%)が履歴に混入した"
+jq -e '[.panels[1].used[] | select(.[1] == 99)] | length == 0' "$VDIR/pace.json" >/dev/null \
+  || fail "履歴異常回帰: h5r を持たない行(99%)が現在窓に混入した"
+vdec="$(python3 - "$VDIR/pace.json" <<'PY'
+import json, sys
+h = json.load(open(sys.argv[1]))["panels"][1]["hist"]
+print(sum(1 for i in range(1, len(h)) if h[i][1] < h[i-1][1]))
+PY
+)"
+[ "$vdec" = "1" ] || fail "履歴異常回帰: 窓の切替は 1 回のはずが $vdec 回（後戻りした窓が混ざっている）"
+vrise="$(python3 - "$VDIR/pace.json" <<'PY'
+import json, sys
+h = json.load(open(sys.argv[1]))["panels"][1]["hist"]
+print(sum(1 for i in range(1, len(h)) if h[i][1] - h[i-1][1] >= 20))
+PY
+)"
+[ "$vrise" = "0" ] || fail "履歴異常回帰: 20pt 以上の急上昇が $vrise 回（100→0→100 の形）"
+jq -e '(.panels[1].hist | map(.[1]) | max) == 90' "$VDIR/pace.json" >/dev/null \
+  || fail "履歴異常回帰: 前の窓のピーク 90 が失われた"
+ok "履歴の異常除去: 後戻りする窓と h5r 欠落行を弾き、急上昇 0・窓の切替 1 回"
+
 # 6) serve.sh が / と /pace.json を配信
 bash "$TP_DIR/bin/serve.sh" >/dev/null || fail "serve.sh が非ゼロ終了"
 [ -r "$TP_DIR/.web_server" ] || fail ".web_server が記録されていない"

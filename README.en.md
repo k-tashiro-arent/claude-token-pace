@@ -16,6 +16,8 @@ An interactive, browser-based viewer for your Claude Code **token consumption pa
 
 From the top: the **5h window** (the 5 hours until the next 5h reset) and the **7d window** (the 7 days until the next 7d reset). More panels appear depending on your setup — **`1mo`** (until the next month-start reset) on accounts with a monthly usage-credit allowance (extra usage, see [Monthly usage credits](#monthly-usage-credits-extra-usage)), and **the Codex CLI's own windows** (`codex 5h`, `codex 7d`, …) when Codex is installed — following whatever window structure Codex reports (see [Codex rate limits](#codex-rate-limits-optional)).
 
+Because the x axis means something different in each panel, you can also put them all on **one shared time axis** (see [Align mode](#align-mode)).
+
 ## Why
 - **Runs on your existing Claude subscription** — no API key, no extra cost. It just reads the rate-limit data Claude Code already has.
 - **Business-hours-aware pace** — the 7-day even pace follows your working hours (a staircase), not a flat line, so "am I burning too fast?" is actually meaningful.
@@ -68,6 +70,27 @@ In Claude Code:
 /tpw
 ```
 A local HTTP server (`127.0.0.1`) starts and the viewer opens in your default browser. The viewer auto-refreshes every few seconds.
+
+## Viewer controls
+
+Three buttons sit at the top right.
+
+| Button | What it does |
+|---|---|
+| `◐` | Switch between the dark and light theme (remembered) |
+| `▶` | Fast-forward replay: sweeps the last 7 days in about 6 seconds, reproducing window resets |
+| `Align` | Put every panel on one shared time axis (below) |
+
+### Align mode
+
+Normally each panel draws its own window (5 hours for `5h`, 7 days for `7d`, …), so the x axis means something different in each one. `Align` puts **every panel on the same time axis** (right edge = now, 30 days wide by default) so you can compare consumption across the different limits. The choice is remembered.
+
+- **Past windows are shown too, not just the current one.** The value drops back near zero at every window change, so the series is a sawtooth.
+- **Segments where usage decreases are not drawn at all** — no line, no fill. A decrease only happens at a window change or a mid-window reset, neither of which is continuous consumption. (The same rule applies in normal mode.)
+- **The even-pace line (dotted) is drawn only for long windows** (`7d`, `1mo`, `codex 7d`). The 5-hour windows would need well over a hundred baselines across 30 days, so they are left out. Where windows overlap (Codex re-anchors its window every time usage resumes) each baseline is drawn only for the period that window was the current one.
+- **The header shows just the window name** — `used` / `pace` / `→reset` describe the current window, so they are omitted here.
+- `▶` in this mode slides **a 30-day window from 60 days ago up to now**, which is why twice the displayed span (60 days by default) is kept as history.
+- Where the records do not go back that far, the axis shrinks to **the oldest record across all logs**. The axis is shared, so a panel whose records start later simply has an empty left side.
 
 ## Data collection & accumulation
 - Usage is recorded **automatically while you use Claude Code** (on each update of Claude Code's status line / `statusLine`). Sampling is throttled to about once per 30 s, and the graph (`pace.json`) is regenerated about every 3 minutes.
