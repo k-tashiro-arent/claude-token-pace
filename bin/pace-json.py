@@ -894,6 +894,34 @@ def attach_history(panels, rows, crows, xrows, now_epoch):
     return lo
 
 
+def _panel_rank(p):
+    """パネルの新しさ。最後の観測時刻を優先し、同じなら窓の終了が遅い方を新しいとみなす。"""
+    used = p.get("used") or []
+    last = used[-1][0] if used else float("-inf")
+    x1 = p.get("x1")
+    return (last, x1 if x1 is not None else float("-inf"))
+
+
+def dedupe_panels(panels):
+    """同じキーの枠が複数できたら、最新の 1 枚だけ残す（並び順は最初に出た位置を保つ）。
+
+    Codex は枠の構成が変わることがあり、古い列に最後の観測が残ったままになる。実測:
+    2026-09-30 16:41 に 5h+7d → 7d へ変わり、7d が secondary 列から primary 列へ移った。
+    取り残された secondary 列の窓は終了が 2 日先だったため _codex_panel の「終了済み窓」
+    ガード（hi <= now）では落ちず、同じ "codex 7d" が 2 枚できた（used 8% と 81%）。
+    窓の終わりだけでは古い枠を落とせないので、最後に観測された＝今も更新されている方を採る。
+    """
+    best, order = {}, []
+    for p in panels:
+        k = p.get("key")
+        if k not in best:
+            order.append(k)
+            best[k] = p
+        elif _panel_rank(p) > _panel_rank(best[k]):
+            best[k] = p
+    return [best[k] for k in order]
+
+
 def write_json(rows, crows, xrows, now_epoch, reset5_epoch, reset7_epoch):
     """pace.json をアトミック更新（tmp→replace、プロセス固有 tmp）。
 
@@ -910,6 +938,7 @@ def write_json(rows, crows, xrows, now_epoch, reset5_epoch, reset7_epoch):
     if month is not None:
         panels.append(month)     # credits.jsonl が無い環境では 5h/7d の 2 枚のまま
     panels.extend(build_codex_panels(xrows, now_epoch))   # codex.jsonl が無ければ 0 枚
+    panels = dedupe_panels(panels)       # 枠の構成が変わった直後は同じキーが 2 枚できる
     hist_x0 = attach_history(panels, rows, crows, xrows, now_epoch)
     data = {
         "generated_at": gv if gv is not None else now_epoch,
