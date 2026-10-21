@@ -2,7 +2,7 @@
 
 A browser graph of your Claude Code **usage** (the 5-hour, 7-day and other rate limits). It shows **how far you are from the standard pace**, in color and numbers, so you can see at a glance whether you are on course to exhaust a quota. **Everything runs locally, and the usage data it collects never leaves your machine.**
 
-*[日本語](README.md) | English* ・ version **0.4.0** (SemVer)
+*[日本語](README.md) | English* ・ version **0.4.1** (SemVer)
 
 [![CI](https://github.com/k-tashiro-arent/claude-token-pace/actions/workflows/ci.yml/badge.svg)](https://github.com/k-tashiro-arent/claude-token-pace/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/k-tashiro-arent/claude-token-pace)](https://github.com/k-tashiro-arent/claude-token-pace/releases)
