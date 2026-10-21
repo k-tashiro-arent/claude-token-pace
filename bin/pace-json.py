@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """pace.jsonl -> pace.json（ブラウザ用の処理済み系列）。標準ライブラリのみ・matplotlib/PNG 不要。
 
-- 入力 : $TOKEN_PACE_DIR/pace.jsonl     (1行1サンプル。sampler が append)
+- 入力 : $TOKEN_PACE_DIR/pace.jsonl     (1行1サンプル。usage-fetch.py が append)
          $TOKEN_PACE_DIR/credits.jsonl (月次クレジット枠。credits-fetch.py が append。任意)
 - 出力 : $TOKEN_PACE_DIR/pace.json   (tmp -> os.replace でアトミック更新)
 - 設定 : $TOKEN_PACE_DIR/biz-hours.json  (標準ペースの基準。無い/不正なら既定 月-金 9-18)
@@ -13,9 +13,11 @@ target 窓は「最大 ts 行の resets_at」ではなく「観測された rese
 (max_reset)。idle/古いセッションが fresh な ts で古い resets_at を書いても窓が後退しない。
 """
 
+import array
 import json
 import math
 import os
+import struct
 import sys
 from datetime import datetime, timezone
 
@@ -44,10 +46,39 @@ HISTORY_DATA_SPAN = 60 * 86400  # 履歴として「持たせる」長さ=2か�
                                 # 60 日前から現在まで滑るので、表示幅の倍のデータが要る。
                                 # どちらも、全ログを通じてより新しい記録しか無ければ最古まで。
 
-# Codex の resets_at は同じ窓でも数秒ゆらぐ（実測: 論理窓 31 個中 29 個・最大 15 秒）。
-# この許容内の値は同一窓として扱う。完全一致で絞ると窓が分裂し、最大値を現在窓に
-# 選んだ結果その窓の観測をほとんど捨ててしまう。
-CODEX_RESET_TOL = 60
+# resets_at は同じ窓でも数秒ゆらぐ（実測: Codex は論理窓 31 個中 29 個・最大 15 秒。
+# Claude は 55 日・5h 163 窓 / 7d 9 窓でゆらぎ 0）。この許容内の値は同一窓として扱う。
+# 完全一致で絞ると窓が分裂し、最大値を現在窓に選んだ結果その窓の観測を
+# ほとんど捨ててしまう。両側で同じ規則にする（Claude 側もゆらぎ得ることを前提にする）。
+RESET_TOL = 60
+
+# 予測（使用率の確率分布）の取り込み。別ツール claude-codex-router が窓ごとの分位を書く。
+# 置き場所は router 自身のデータディレクトリ（各ツールは自分のディレクトリにだけ書く）。
+# FORECAST_JSON で明示指定もできる。ファイルが無ければ帯を出さないだけで、他の表示は変わらない。
+FORECAST_JSON = os.path.expanduser(
+    os.environ.get("FORECAST_JSON")
+    or os.path.join(os.environ.get("CLAUDE_CODEX_ROUTER_DIR") or "~/.claude/codex-router",
+                    "data", "forecast.json"))
+FORECAST_RESET_TOL = 120   # 予測の窓とパネルを突き合わせる許容差（秒。実測の差は 0〜3 秒）
+# 予測は標本そのもの（窓ごとに ts[] と paths[][]）で届く。描く分位はこちらで切り出す。
+FORECAST_LEVELS = tuple(round(0.05 * k, 2) for k in range(1, 20))   # 5% 刻み 19 段階
+# 予測が今の状態に合っているかは、相手の更新間隔ではなく起点のずれだけで見る。
+# 超えても捨てない。帯の描き方を変えて（黄色・薄く）古いことを示す。消すと理由が伝わらない。
+FORECAST_U_TOL = 5.0       # 起点 u と今の used% の差（ポイント）
+
+# 再生（早送り）中にも帯を出すため、分位を 15 分格子で追記して PLAYBACK_SPAN ぶん持つ。
+# 予測が付いているパネルはすべて書く（枠をこちらで選ばない）。枠の構成は
+# Codex 側の都合で変わるので、固定の一覧を持つと新しい枠が黙って落ちる。
+# ビューアの再生カーソルも同じ格子に乗るので、帯の起点とカーソルが必ず一致する。
+# 形式は uint16 の時間方向差分（分位は時間方向に単調なので差分は 0 以上。
+# 実測 215 万組で減少 0）。実測で 7 日・2 枠が 2.4 MB、gzip 後 0.53 MB。
+# 同じものを JSON で並べると 7.3 MB・1.6 MB になる。
+FC_HIST_OUT = os.path.join(TP_DIR, "forecast-hist.bin")
+FC_HIST_SLOT = 900             # 追記の格子（秒）。ビューアの PB_SLOT と揃える
+FC_HIST_MAGIC = b"TPFC"
+FC_HIST_VER = 2                # 2: 枠を番号ではなくパネルのキーで持つ（枠を固定しないため）
+FC_HIST_HEAD = "<IHIIHH"       # slot / キーの長さ / 終端時刻 / 刻み×100 / ステップ数 / 起点×10
+FC_HIST_HEAD_SZ = struct.calcsize(FC_HIST_HEAD)
 
 
 def load_biz_config():
@@ -153,8 +184,33 @@ def envelope(seq):
     return out
 
 
+def mark_old_window(rows):
+    """h5r が後退した行に「古い窓のスナップショット」の印を付ける（ts 昇順の前提）。
+
+    5h のリセット時刻は前へ進むだけなので、いったん観測した h5r より古い h5r を報告する
+    行は、別の（古い）窓のスナップショットである。観測時点より h5r が未来なので _stale
+    では弾けない。実測: 2026-10-20 12:51:43 の 1 行が h5=0 / d7=100・h5r は現窓より
+    2 時間 20 分前 を報告し、前後が d7=5〜10 のところで 7d が 100% へ跳ねた。
+    """
+    seen = None
+    for r in rows:
+        v = r.get("h5r")
+        if v is None:
+            continue
+        try:
+            v = float(v)
+        except (ValueError, TypeError):
+            continue
+        if seen is not None and v < seen - RESET_TOL:
+            r["_old_window"] = True      # 以降の判定は _stale に集約する
+        elif seen is None or v > seen:
+            seen = v
+
+
 def _stale(r, ts, strict=False):
     """観測時点で既に過ぎた 5h リセットを持つ行＝古いスナップショット。
+
+    あわせて、mark_old_window が付けた「h5r が後退した行」の印もここで見る。
 
     新鮮な観測は必ず「5h リセット(h5r) が観測時点より未来」。セッション再開直後などに
     statusLine が過去の rate_limits スナップショットを出すことがあり、7d は窓が長いため
@@ -165,6 +221,8 @@ def _stale(r, ts, strict=False):
     そのうち 1 行が前後の正常値 2% に対して d7=100 を報告しており、包絡の running-max が
     100 へ跳ね返って「100→0→100」の異常な形になっていた。
     """
+    if r.get("_old_window"):     # mark_old_window が付けた印（h5r が後退した行）
+        return True
     v = r.get("h5r")
     if v is None:
         return strict
@@ -270,7 +328,7 @@ def history_series(rows, val_key, reset_key, lo_epoch, hi_epoch,
 def window_series(rows, val_key, reset_key, target_reset, lo_epoch, hi_epoch):
     """対象窓の観測だけを取り出し、時刻昇順・envelope した (xs, ys) を返す。
 
-    - target_reset に一致する resets_at の観測のみ採用（別窓の遅延観測を除外）。
+    - target_reset から RESET_TOL 以内の resets_at の観測のみ採用（別窓の遅延観測を除外）。
     - stale スナップショット除外: 新鮮な観測は必ず「5h リセット(h5r) が観測時点より未来」。
       h5r <= ts の行は、セッション再開直後などに statusLine が出した過去の rate_limits
       スナップショット（別=過去の 5h 窓の値）なので捨てる。7d 窓は 7 日長のため古い
@@ -292,7 +350,7 @@ def window_series(rows, val_key, reset_key, target_reset, lo_epoch, hi_epoch):
             continue
         if target_reset is not None and rk is not None:
             try:
-                if float(rk) != target_reset:
+                if abs(float(rk) - target_reset) > RESET_TOL:
                     continue
             except (ValueError, TypeError):
                 pass
@@ -375,7 +433,7 @@ def build_panels(rows, now_epoch, reset5_epoch, reset7_epoch):
         r5, w5 = now_epoch, now_epoch - FIVE_HOUR
     xs, ys = window_series(rows, "h5", "h5r", reset5_epoch, w5,
                            reset5_epoch or (w5 + FIVE_HOUR))
-    used = [[x.timestamp(), y] for x, y in zip(xs, ys)]
+    used = _used_series(xs, ys)
     even = [[w5, 0.0], [r5, 100.0]] if reset5_epoch is not None else []
     std5 = max(0.0, min(100.0, (now_epoch - w5) / FIVE_HOUR * 100.0))
     panels.append({
@@ -392,7 +450,7 @@ def build_panels(rows, now_epoch, reset5_epoch, reset7_epoch):
         r7, w7 = now_epoch, now_epoch - SEVEN_DAY
     xs, ys = window_series(rows, "d7", "d7r", reset7_epoch, w7,
                            reset7_epoch or (w7 + SEVEN_DAY))
-    used = [[x.timestamp(), y] for x, y in zip(xs, ys)]
+    used = _used_series(xs, ys)
     if reset7_epoch is not None:
         bx, by = biz_baseline(w7, reset7_epoch)
         even = [[x.timestamp(), y] for x, y in zip(bx, by)]
@@ -441,8 +499,22 @@ def compress_steps(pts):
     return out
 
 
+def _used_series(xs, ys):
+    """window_series の出力をパネルの used 形式にする。同値が続く区間は間引く。
+
+    使用率は整数で包絡済みなので、大半の点は前後と同値になる。階段の形は変わらず、
+    実測で 7d が 779 点 → 58 点、Codex が 497 点 → 12 点になる（pace.json は 5 秒ごとに配信される）。
+    履歴（history_series）と月次パネルは元から間引いているので、それに揃える。
+    """
+    return [[t, y] for t, y in compress_steps([(x.timestamp(), y) for x, y in zip(xs, ys)])]
+
+
 def build_month_panel(crows, now_epoch):
     """月次クレジット枠（extra usage）のパネル。credits.jsonl が無ければ None。
+
+    枠が無効（extra_usage.is_enabled=false）な期間は出さない。無い予算を表示すると
+    「使い切ってよい枠がある」と誤読されるうえ、残存した monthly_limit に対する
+    used% は意味を持たないため。
 
     100% = monthly_limit（＝支出上限）。5h/7d と違い「使い切ってよい枠」ではないので、
     even ペース（満額基準）に対して灰色＝上限を使い切る軌道である点に注意。
@@ -458,6 +530,26 @@ def build_month_panel(crows, now_epoch):
         return None
     w1 = month_bounds(target - 1)[0]     # m1r は翌月1日00:00 なので 1 秒引いて当月に落とす
     r1 = target
+
+    # 枠そのものが無効ならパネルを出さない。credits-fetch が API の
+    # extra_usage.is_enabled を "en" として記録する。枠が無効でも monthly_limit に前の
+    # 値が残ることがあるため、金額ではなくこのフラグで判定する（実測: limit は全行で正）。
+    # "en" を持たない古い行は判定に使わない（記録前の履歴を消さないため）。
+    latest_en, latest_en_ts = None, None
+    for r in crows:
+        en = r.get("en")
+        if not isinstance(en, bool):
+            continue
+        try:
+            ts = float(r.get("ts"))
+        except (ValueError, TypeError):
+            continue
+        if ts < w1 or ts > r1:
+            continue                     # 当月の観測だけを見る
+        if latest_en_ts is None or ts > latest_en_ts:
+            latest_en_ts, latest_en = ts, en
+    if latest_en is False:
+        return None
 
     pts = []
     for r in crows:
@@ -507,7 +599,7 @@ def _win_label(minutes):
     return f"{m}m"
 
 
-def _reset_buckets(values, tol=CODEX_RESET_TOL):
+def _reset_buckets(values, tol=RESET_TOL):
     """近接する resets_at を論理窓ごとにまとめる（昇順のグループ列を返す）。"""
     groups = []
     for v in sorted(values):
@@ -516,6 +608,18 @@ def _reset_buckets(values, tol=CODEX_RESET_TOL):
         else:
             groups.append([v])
     return groups
+
+
+def _codex_even(w1, r1, step=None):
+    """Codex の枠の標準ペース線と xmode。窓の長さで規則が変わるのでパネルと再生で共有する。
+
+    step を渡すと階段の刻みを粗くできる。再生は窓を何枚も持つので、
+    線の点数が pace.json の大きさにそのまま足し上がる。
+    """
+    if r1 - w1 <= 86400:                    # 1 日以内の窓は 5h と同じく均等直線
+        return [[w1, 0.0], [r1, 100.0]], "time"
+    bx, by = biz_baseline(w1, r1, step=step or (1800 if r1 - w1 > SEVEN_DAY else 600))
+    return [[x.timestamp(), y] for x, y in zip(bx, by)], "date"   # 長い窓は就業時間の階段
 
 
 def _codex_panel(rows, ukey, wkey, rkey, now_epoch):
@@ -580,19 +684,15 @@ def _codex_panel(rows, ukey, wkey, rkey, now_epoch):
     w1 = r1 - float(wm) * 60
     pts.sort(key=lambda x: x[0])
     ys = envelope([y for _, y in pts])
-    used = [[t, y] for (t, _), y in zip(pts, ys)]
+    used = [[t, y] for t, y in compress_steps([(t, y) for (t, _), y in zip(pts, ys)])]
 
-    if float(wm) * 60 <= 86400:             # 1 日以内の窓は 5h と同じく均等直線
-        even = [[w1, 0.0], [r1, 100.0]]
+    even, xmode = _codex_even(w1, r1)
+    if xmode == "time":
         span = r1 - w1
         std = max(0.0, min(100.0, (now_epoch - w1) / span * 100.0)) if span > 0 else 0.0
-        xmode = "time"
-    else:                                   # 長い窓は 7d と同じく就業時間の階段
-        bx, by = biz_baseline(w1, r1, step=1800 if r1 - w1 > SEVEN_DAY else 600)
-        even = [[x.timestamp(), y] for x, y in zip(bx, by)]
+    else:
         denom = bizsec(w1, r1)
         std = max(0.0, min(100.0, bizsec(w1, now_epoch) / denom * 100.0)) if denom > 0 else 0.0
-        xmode = "date"
 
     return {
         "key": "codex " + _win_label(wm), "xmode": xmode,
@@ -615,46 +715,127 @@ def build_codex_panels(rows, now_epoch):
 
 
 def _playback_segments(rows, start, now_epoch, key, val_key, reset_key, win_len, even_fn, xmode):
-    """[start, now] に重なる各窓（観測された reset_key ごと）を古い順にセグメント化して返す。
+    """Claude 側（5h/7d）のセグメント列。観測を拾って共通の組み立てに渡すだけ。
 
-    各窓は既存の window_series で used 包絡線を計算する。ビューアは再生カーソルが窓境界を
-    越えるたびにセグメントを切り替える＝その枠のリセットが再現される。
+    古いスナップショット（_stale）だけはここで弾く。Codex にはこの概念が無い。
     """
-    resets = set()
+    strict = _strict_stale(rows)
+    pts = []
     for r in rows:
-        v = r.get(reset_key)
+        ts, v, rk = r.get("ts"), r.get(val_key), r.get(reset_key)
+        if ts is None or v is None or rk is None:
+            continue
         try:
-            v = float(v)
+            ts, v, rk = float(ts), float(v), float(rk)
         except (ValueError, TypeError):
             continue
-        if v > start and (v - win_len) < now_epoch:   # 窓[v-win, v] が [start, now] と重なる
-            resets.add(v)
-
-    segs = []
-    for rr in sorted(resets):
-        xs, ys = window_series(rows, val_key, reset_key, rr, rr - win_len, rr)
-        used = [[x.timestamp(), y] for x, y in zip(xs, ys)]
-        if not used:
+        if _stale(r, ts, strict):
             continue
-        segs.append({
-            "key": key, "x0": rr - win_len, "x1": rr, "xmode": xmode,
-            "reset_label": _label(rr, xmode),
-            "even": even_fn(rr - win_len, rr),
-            "used": used,
-        })
-    return segs
+        pts.append((ts, v, rk))
+    return _playback_from_points(pts, key, win_len, start, now_epoch,
+                                 lambda w1, r1: (even_fn(w1, r1), xmode))
 
 
-def build_playback(rows, now_epoch):
-    """直近 PLAYBACK_SPAN(=7d) を早送り再生するためのセグメント列（5h/7d 両パネル分）を返す。
+def _sliding_window(obs, win_len):
+    """使用率 0% の間に resets_at が「今から 1 窓後」を返し続けてできた見かけの窓か。
+
+    その窓の観測はすべて「リセット = 観測時刻 + 窓長」になり、窓が一向に進まない。
+    観測数や期間の下限で落とすと、短い実セッションまで消える（実測: Claude 5h の
+    163 窓中 7 窓が 30 分未満で、いずれも used > 0、最大 40%）ので、滑りの形そのもので判定する。
+    実測: Codex 12 窓中 8 窓が該当（いずれも観測 1 点・used 0%）、Claude は 172 窓中 0。
+    """
+    return all(abs(r - ts - win_len) <= RESET_TOL for ts, _u, r in obs)
+
+
+def _playback_from_points(pts, key, win_len, start, now_epoch, even_fn):
+    """(時刻, 使用率, リセット) の列から窓ごとのセグメントを作る（Claude / Codex 共通）。
+
+    窓は resets_at を RESET_TOL で束ねたバケット。used は包絡線にして、階段の形を
+    保ったまま間引く。even_fn は (標準ペース線, xmode) を返す。
+    最後に _clip_segments で次の窓の開始より前に切る。
+    """
+    segs = []
+    for b in _reset_buckets({r for _ts, _u, r in pts}):
+        r1, w1 = b[-1], b[-1] - win_len
+        if not (r1 > start and w1 < now_epoch):      # 窓 [w1, r1] が [start, now] と重ならない
+            continue
+        obs = sorted(p for p in pts if b[0] <= p[2] <= b[-1] and w1 <= p[0] <= r1)
+        if not obs or _sliding_window(obs, win_len):
+            continue
+        ys = envelope([u for _ts, u, _r in obs])
+        used = [[t, y] for t, y in compress_steps([(o[0], y) for o, y in zip(obs, ys)])]
+        even, xmode = even_fn(w1, r1)
+        segs.append({"key": key, "x0": w1, "x1": r1, "xmode": xmode,
+                     "reset_label": _label(r1, xmode), "even": even, "used": used})
+    return _clip_segments(segs)
+
+
+def _clip_segments(segs):
+    """セグメントを開始順に並べ、各々の used を次の窓の開始より前に切る。
+
+    Codex は収集経路が 2 つ（ログと app-server）あるため、窓が切り替わった後に数分だけ
+    古い窓の読みが届く（実測: 10/15 15:13 に切り替わった後、前の窓に 15:15 の観測が 1 点）。
+    残すとそのセグメントの末尾値（ヘッダの used）が、窓が終わった後の値になる。
+    5h/7d は窓が順に並ぶのでこの切り詰めは何もしない。
+    """
+    segs = sorted(segs, key=lambda s: s["x0"])
+    out = []
+    for i, seg in enumerate(segs):
+        if i + 1 < len(segs):
+            nx = segs[i + 1]["x0"]
+            seg["used"] = [u for u in seg["used"] if u[0] < nx]
+        if seg["used"]:
+            out.append(seg)
+    return out
+
+
+def _codex_playback_segments(xrows, start, now_epoch, win_min, key):
+    """Codex の 1 枠ぶんのセグメント列。窓は観測された resets_at のバケットごと。
+
+    Codex の枠は名目の窓長を待たずにサービス側でリセットされる（実測: 記録にある
+    4 回の切り替わりはすべて名目の終わりまで 68.5 / 28.1 / 162.9 / 118.8 時間を残して起きている）。
+    そのため名目の [リセット−窓長, リセット] は重なる。どの窓を見せるかはビューアが
+    「開始済みのうち最も新しい窓」で選ぶ（pbSegAt）。
+
+    使用率 0% の間は resets_at が「今から 1 窓後」を返し続けて数分ずつ滑るため、
+    1 点だけの見かけの窓が並ぶ（実測: 10/13 08:24〜08:56 に 8 個）。履歴と同じ下限で落とす。
+    """
+    pts, seen = [], set()
+    for r in xrows:
+        for ukey, wkey, rkey in (("u", "w", "r"), ("u2", "w2", "r2")):
+            ts, u, v, w = r.get("ts"), r.get(ukey), r.get(rkey), r.get(wkey)
+            if ts is None or u is None or v is None or w is None:
+                continue
+            try:
+                ts, u, v = float(ts), float(u), float(v)
+                if int(w) != int(win_min):
+                    continue
+            except (ValueError, TypeError):
+                continue
+            k = (ts, u, v)
+            if k in seen:
+                continue           # 増分スキャン状態を失った際の重複を吸収
+            seen.add(k)
+            pts.append((ts, u, v))
+    if not pts:
+        return []
+    return _playback_from_points(pts, key, float(win_min) * 60, start, now_epoch,
+                                 lambda w1, r1: _codex_even(w1, r1, step=PLAYBACK_EVEN_STEP))
+
+
+def build_playback(rows, xrows, now_epoch, codex_wins):
+    """直近 PLAYBACK_SPAN(=7d) を早送り再生するためのセグメント列をパネルのキーごとに返す。
 
     - 期間: [max(now-7d, 最古サンプル), now]（履歴が 7d 未満なら最古サンプルから）。
     - この期間に重なる 5h 窓・7d 窓をそれぞれ古い順に列挙する。7d スパンでは 5h 窓は多数回、
       7d 窓も（now-7d が現 7d 窓の開始より前になるため）1 回リセット境界をまたぎ得る。
       ビューアは各パネルで再生カーソルが境界を越えるたびに窓を切り替える＝リセットが再現される。
+    - Codex の枠は codex_wins（キー→窓長(分)）を受け取って同じように並べる。
+      1mo はセグメントを作らない（窓が 1 か月で再生の 7 日間にリセットがほぼ入らず、
+      ライブのパネルをカーソルで切り詰める今の振る舞いで正しいため）。
     - 履歴が短ければ各パネル 1 窓に縮退（リセット無し）。
 
-    データが無い/両パネルともセグメントが作れない場合は None。
+    データが無い/どのパネルもセグメントが作れない場合は None。
     """
     earliest = None
     for r in rows:
@@ -669,17 +850,22 @@ def build_playback(rows, now_epoch):
         return None
     start = max(now_epoch - PLAYBACK_SPAN, earliest)
 
-    def biz_even(x0, x1):
-        bx, by = biz_baseline(x0, x1)
+    def biz_even(x0, x1):   # 窓を何枚も持つので、Codex と同じく粗い刻みで点数を抑える
+        bx, by = biz_baseline(x0, x1, step=PLAYBACK_EVEN_STEP)
         return [[x.timestamp(), y] for x, y in zip(bx, by)]
 
-    seg5h = _playback_segments(rows, start, now_epoch, "5h", "h5", "h5r", FIVE_HOUR,
-                               lambda x0, x1: [[x0, 0.0], [x1, 100.0]], "time")
-    seg7d = _playback_segments(rows, start, now_epoch, "7d", "d7", "d7r", SEVEN_DAY,
-                               biz_even, "date")
-    if not seg5h and not seg7d:
+    segs = {
+        "5h": _playback_segments(rows, start, now_epoch, "5h", "h5", "h5r", FIVE_HOUR,
+                                 lambda x0, x1: [[x0, 0.0], [x1, 100.0]], "time"),
+        "7d": _playback_segments(rows, start, now_epoch, "7d", "d7", "d7r", SEVEN_DAY,
+                                 biz_even, "date"),
+    }
+    for key, win_min in (codex_wins or {}).items():
+        segs[key] = _codex_playback_segments(xrows, start, now_epoch, win_min, key)
+    segs = {k: v for k, v in segs.items() if v}
+    if not segs:
         return None
-    return {"start": start, "now": now_epoch, "seg5h": seg5h, "seg7d": seg7d}
+    return {"start": start, "now": now_epoch, "segs": segs}
 
 
 def _month_hist_points(crows, lo_epoch, hi_epoch):
@@ -731,11 +917,13 @@ def _codex_history(xrows, win_min, lo_epoch, hi_epoch):
                 pts.append({"ts": ts, "v": u, "r": rk})
     win_len = float(win_min) * 60
     xmode = "time" if win_len <= 86400 else "date"
-    return history_series(pts, "v", "r", lo_epoch, hi_epoch, tol=CODEX_RESET_TOL,
+    return history_series(pts, "v", "r", lo_epoch, hi_epoch, tol=RESET_TOL,
                           even_fn=lambda r, t: even_at(r, t, win_len, xmode))
 
 
 HISTORY_EVEN_STEP = 3600   # 履歴の標準ペース線の刻み（30 日を 1 時間刻みで十分な解像度）
+PLAYBACK_EVEN_STEP = 1800  # 再生の窓の標準ペース線の刻み。窓を何枚も持つので点数を抑える
+                           # （7 日の窓で 336 点。表示幅 600px なら 1 点 1.8px で階段の形は見分けない）
 HISTORY_EVEN_MIN_OBS = 2      # これ未満の観測しかない窓は基準線を引かない
 HISTORY_EVEN_MIN_SPAN = 1800  # 観測がこの秒数未満に収まる窓も同様（下記のスライド対策）
 
@@ -839,7 +1027,7 @@ def _codex_hist_even(xrows, win_min, lo_epoch, hi_epoch):
                 continue
         return got
 
-    spans = window_spans(xrows, None, lo_epoch, hi_epoch, tol=CODEX_RESET_TOL, sel=sel)
+    spans = window_spans(xrows, None, lo_epoch, hi_epoch, tol=RESET_TOL, sel=sel)
     return _hist_even(spans, lambda rep: (rep - win_len, rep), lo_epoch, hi_epoch)
 
 
@@ -869,16 +1057,18 @@ def attach_history(panels, rows, crows, xrows, now_epoch):
     lo = max(now_epoch - HISTORY_DATA_SPAN, oldest)
 
     hist = {
-        "5h": history_series(rows, "h5", "h5r", lo, now_epoch, use_stale_filter=True,
+        "5h": history_series(rows, "h5", "h5r", lo, now_epoch, tol=RESET_TOL,
+                             use_stale_filter=True,
                              even_fn=lambda r, t: even_at(r, t, FIVE_HOUR, "time")),
-        "7d": history_series(rows, "d7", "d7r", lo, now_epoch, use_stale_filter=True,
+        "7d": history_series(rows, "d7", "d7r", lo, now_epoch, tol=RESET_TOL,
+                             use_stale_filter=True,
                              even_fn=lambda r, t: even_at(r, t, SEVEN_DAY, "date")),
         "1mo": _month_hist_points(crows, lo, now_epoch),
     }
     even_hist = {
-        "7d": _hist_even(window_spans(rows, "d7r", lo, now_epoch),
+        "7d": _hist_even(window_spans(rows, "d7r", lo, now_epoch, tol=RESET_TOL),
                          lambda rep: (rep - SEVEN_DAY, rep), lo, now_epoch),
-        "1mo": _hist_even(window_spans(crows, "m1r", lo, now_epoch),
+        "1mo": _hist_even(window_spans(crows, "m1r", lo, now_epoch, tol=RESET_TOL),
                           lambda rep: month_bounds(rep - 1), lo, now_epoch),
     }
     for p in panels:
@@ -922,6 +1112,218 @@ def dedupe_panels(panels):
     return [best[k] for k in order]
 
 
+def read_forecast(path=None):
+    """router が書いた予測を読む。無い・壊れている・形が違えば {}（帯を出さないだけ）。
+
+    出力仕様は相手の都合で変わり得るので、少しでも形が違えば黙って捨てる。ここで例外を
+    上げると pace.json 全体が出なくなり、予測と関係のない表示まで止まるため。
+    """
+    target = FORECAST_JSON if path is None else path
+    try:
+        with open(target, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) and isinstance(d.get("windows"), dict) else {}
+
+
+def _quantile(col, q):
+    """昇順の列から分位を 1 つ拾う（順序統計。router の取り方に合わせる）。"""
+    return col[min(max(math.ceil(q * len(col)) - 1, 0), len(col) - 1)]
+
+
+def _fc_points(w):
+    """予測の 1 窓（ts[] と paths[][]）を [[ts, 分位…], …] に直す。
+
+    paths は標本そのもので、ステップごとの並べ替えはされていない。分位はここで切り出す。
+    値は上限 100 で打ち切る（使用率は上限を超えない）。打ち切りは単調なので、
+    並べ替えの後に当てても分位は変わらない。
+    長さの合わない標本は捨てる。残りが無い・2 点未満なら帯にならないので None。
+    """
+    ts, paths = w.get("ts"), w.get("paths")
+    if not isinstance(ts, list) or len(ts) < 2 or not isinstance(paths, list) or not paths:
+        return None, None
+    try:
+        tsf = [float(v) for v in ts]
+        good = [[float(v) for v in pa] for pa in paths
+                if isinstance(pa, list) and len(pa) == len(ts)]
+    except (TypeError, ValueError):
+        return None, None
+    if not good:
+        return None, None
+    pts = []
+    for j, tj in enumerate(tsf):
+        col = sorted(min(pa[j], 100.0) for pa in good)
+        pts.append([tj] + [round(_quantile(col, q), 2) for q in FORECAST_LEVELS])
+    return list(FORECAST_LEVELS), pts
+
+
+def _fc_p_full(w):
+    """リセット時に上限へ達している標本の割合。出せなければ None。"""
+    paths = w.get("paths")
+    if not isinstance(paths, list) or not paths:
+        return None
+    last = []
+    for pa in paths:
+        if isinstance(pa, list) and pa:
+            try:
+                last.append(float(pa[-1]))
+            except (TypeError, ValueError):
+                return None
+    return round(sum(1 for v in last if v >= 100.0) / len(last), 4) if last else None
+
+
+def attach_forecast(panels, now_epoch, data=None):
+    """対応する窓の予測を各パネルに fc として付ける。対応が無いパネルは触らない。
+
+    突き合わせは「側（Claude/Codex）＋リセット時刻」で行う。予測側の窓の名前
+    （claude-session / codex-7d など）は相手の都合で変わり得るのに対し、同じ窓なら
+    リセット時刻は一致するため（実測の差は 0〜3 秒）。側はパネルのキーから決める。
+    月次クレジット枠（1mo）に対応する窓は予測側に無いので、何も付かない。
+
+    予測が今に合っているかは起点のずれ 1 本で見る。経過時間でも別に判定していたが、
+    実測では経過の許容ちょうどの時点で既に起点が許容を超えている割合が 7d で 6〜8 割あり、
+    二重になっていた。合っていなくても捨てず、fc.stale を立てて描き方で示す。
+    """
+    data = read_forecast() if data is None else data
+    wins = data.get("windows") if isinstance(data, dict) else None
+    if not isinstance(wins, dict):
+        return
+    try:
+        t0 = int(float(data["t"]))
+    except (KeyError, TypeError, ValueError):
+        t0 = None
+    for p in panels:
+        x1 = p.get("x1")
+        if x1 is None:
+            continue
+        side = "codex" if str(p.get("key") or "").startswith("codex") else "claude"
+        for w in wins.values():
+            if not isinstance(w, dict) or w.get("side") != side:
+                continue
+            try:
+                if abs(float(w["r"]) - x1) > FORECAST_RESET_TOL:
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
+            levels, pts = _fc_points(w)
+            if not pts:
+                continue
+            stale = False                              # 起点が今の実績から離れていれば「古い」
+            u, un = w.get("u"), p.get("used_now")
+            if u is not None and un is not None:
+                try:
+                    stale = abs(float(u) - float(un)) > FORECAST_U_TOL
+                except (TypeError, ValueError):
+                    stale = False
+            p["fc"] = {"t": t0, "levels": levels, "pts": pts,
+                       "p_full": _fc_p_full(w), "stale": stale}
+            break
+
+
+def _fch_header():
+    """先頭 8 + 2L バイト: 魔法 4 + 版 2 + 分位の数 2 + 分位×1000 を L 個。
+
+    分位の並びが変わったら先頭が一致しなくなるので、古いファイルは捨てて作り直す。
+    """
+    lv = FORECAST_LEVELS
+    return (FC_HIST_MAGIC + struct.pack("<HH", FC_HIST_VER, len(lv))
+            + struct.pack("<%dH" % len(lv), *(int(round(q * 1000)) for q in lv)))
+
+
+def _fch_record(slot, key, fc, used_now):
+    """1 レコードを組む。各ステップの時刻は持たず、終端時刻と刻みから復元する。
+
+    窓の突き合わせに使う終端時刻は予測そのものの最終ステップを採る（パネルの x1 ではなく）。
+    両者は数秒ずれ得るので、時刻軸の起点と突き合わせの基準を同じ値にする。
+    """
+    pts, lv = fc.get("pts") or [], fc.get("levels") or []
+    n, size = len(pts), len(lv)
+    if n < 2 or size != len(FORECAST_LEVELS):
+        return None
+    step = (pts[-1][0] - pts[0][0]) / (n - 1)
+    if not (step > 0):
+        return None
+    body, prev = array.array("H"), [0] * size
+    for row in pts:
+        if len(row) != size + 1:
+            return None
+        for i in range(size):
+            v = min(65535, max(0, int(round(row[1 + i] * 10))))
+            body.append(max(0, v - prev[i]))   # 分位は時間方向に単調なので 0 以上
+            prev[i] = v
+    kb = str(key).encode("utf-8")
+    head = struct.pack(FC_HIST_HEAD, int(slot), len(kb), int(round(pts[-1][0])),
+                       int(round(step * 100)), n,
+                       min(65535, max(0, int(round((used_now or 0) * 10)))))
+    return head + kb + body.tobytes()
+
+
+def _fch_read(path):
+    """追記ファイルを (slot, 生バイト) の列に分解する。
+
+    先頭が今の分位と違う・途中で切れているなら (False, []) を返し、呼び出し側が作り直す。
+    切り詰めは先頭からレコードをたどって組み直す（途中の位置へは飛べない）。
+    """
+    try:
+        with open(path, "rb") as f:
+            buf = f.read()
+    except OSError:
+        return False, []
+    head = _fch_header()
+    if not buf.startswith(head):
+        return False, []
+    size, i, out = len(FORECAST_LEVELS), len(head), []
+    while i + FC_HIST_HEAD_SZ <= len(buf):
+        slot, klen, _tend, _step, n, _u = struct.unpack_from(FC_HIST_HEAD, buf, i)
+        end = i + FC_HIST_HEAD_SZ + klen + 2 * n * size
+        if end > len(buf):
+            return False, []
+        out.append((slot, buf[i:end]))
+        i = end
+    if i != len(buf):
+        return False, []
+    return True, out
+
+
+def append_forecast_hist(panels, now_epoch):
+    """予測の分位を 15 分格子で追記し、PLAYBACK_SPAN より古いものを落とす。
+
+    予測が付いているパネルをすべて書く。枠の対応付けは attach_forecast が付けた
+    p["fc"] をそのまま使うので、ライブ表示と同じ規則（側＋リセット時刻の許容）になる。
+    予測が無ければ何もしない。
+    """
+    slot = int(now_epoch // FC_HIST_SLOT) * FC_HIST_SLOT
+    recs = []
+    for p in panels:
+        fc, key = p.get("fc"), p.get("key")
+        if not fc or not key:
+            continue
+        rec = _fch_record(slot, key, fc, p.get("used_now"))
+        if rec:
+            recs.append((slot, rec))
+    if not recs:
+        return
+    ok, old = _fch_read(FC_HIST_OUT)
+    if ok and old and old[-1][0] >= slot:
+        return                              # この格子はもう書いてある
+    cutoff = now_epoch - PLAYBACK_SPAN
+    keep = [r for r in (old if ok else []) if r[0] >= cutoff]
+    tmp = "%s.%d.tmp" % (FC_HIST_OUT, os.getpid())
+    try:
+        with open(tmp, "wb") as f:
+            f.write(_fch_header())
+            for _slot, raw in keep + recs:
+                f.write(raw)
+        os.replace(tmp, FC_HIST_OUT)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
 def write_json(rows, crows, xrows, now_epoch, reset5_epoch, reset7_epoch):
     """pace.json をアトミック更新（tmp→replace、プロセス固有 tmp）。
 
@@ -939,11 +1341,18 @@ def write_json(rows, crows, xrows, now_epoch, reset5_epoch, reset7_epoch):
         panels.append(month)     # credits.jsonl が無い環境では 5h/7d の 2 枚のまま
     panels.extend(build_codex_panels(xrows, now_epoch))   # codex.jsonl が無ければ 0 枚
     panels = dedupe_panels(panels)       # 枠の構成が変わった直後は同じキーが 2 枚できる
+    # Codex の窓長は attach_history が _win を取り除くので、その前に控える
+    codex_wins = {p["key"]: p["_win"] for p in panels if p.get("_win") is not None}
     hist_x0 = attach_history(panels, rows, crows, xrows, now_epoch)
+    attach_forecast(panels, now_epoch)   # router の予測があれば載せる。無ければ何も付かない
+    try:
+        append_forecast_hist(panels, now_epoch)   # 再生用に 15 分格子で追記
+    except (OSError, ValueError, struct.error):
+        pass                                      # 付加機能なので pace.json の生成は止めない
     data = {
         "generated_at": gv if gv is not None else now_epoch,
         "panels": panels,
-        "playback": build_playback(rows, now_epoch),
+        "playback": build_playback(rows, xrows, now_epoch, codex_wins),
     }
     if hist_x0 is not None:      # Align モード（全パネル共通の時間軸）の範囲
         data["hist_lo"] = hist_x0                                 # 履歴データの左端(再生の開始位置)
@@ -979,6 +1388,8 @@ def main():
         pass  # fcntl 非対応環境（Windows）は排他なしで続行（対象外だが安全側）
 
     rows = read_rows()
+    rows.sort(key=lambda r: r.get("ts") or 0)   # 印は ts 昇順で付ける（追記順だが念のため）
+    mark_old_window(rows)
     prune_if_needed(len(rows))
     crows = read_jsonl(CREDITS_LOG)         # 任意。無ければ月次パネルを出さない
     xrows = read_jsonl(CODEX_LOG)           # 任意。無ければ Codex パネルを出さない

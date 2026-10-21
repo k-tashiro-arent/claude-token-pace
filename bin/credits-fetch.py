@@ -6,16 +6,20 @@ statusLine の JSON に載るレート枠は 5h/7d の used%/resets_at だけで
 エンドポイント GET /api/oauth/usage から取得する。
 
 - 認証 : $CLAUDE_CONFIG_DIR(既定 ~/.claude)/.credentials.json の claudeAiOauth.accessToken
+         （macOS はこのファイルが無く Keychain に入るので、security コマンドで読む）
          を読むだけ。期限切れ・不在なら何もしない（refresh は Claude Code 本体に任せる。
          ここで refresh すると refreshToken のローテーションで本体の認証を壊しうる）。
-- 出力 : $TOKEN_PACE_DIR/credits.jsonl  {ts, used, limit, m1r}
+- 出力 : $TOKEN_PACE_DIR/credits.jsonl  {ts, used, limit, m1r, en}
          used/limit は API の minor 単位そのまま（USD なら cent）。
          m1r = 翌月1日 00:00(ローカル) の epoch＝この枠のリセット時刻。
+         en  = extra_usage.is_enabled＝枠そのものの有無。枠が無効でも monthly_limit に
+               前の値が残ることがあるため、金額とは別にこのフラグを残す。
 - 失敗 : 何が起きても exit 0（statusLine / サンプリングに波及させない）。
 """
 
 import json
 import os
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -35,13 +39,43 @@ MAX_LINES = 20000      # 肥大時はこの行数までに prune
 KEEP_LINES = 12000     # prune 後に残す行数（月次窓に必要な 1 か月分を割らない量）
 
 
+# macOS では Claude Code が認証情報をファイルではなく Keychain に入れる（ファイルに出す
+# 公式の方法は無く、要望 issue も not planned で閉じている）。中身は同じ JSON なので、
+# ファイルが無いときだけ security コマンドで読む。別プロセスからの読み出しは Keychain の
+# 許可を求められることがあるため、短いタイムアウトで諦める（定期実行は画面の無い文脈で
+# 走ることがある）。サービス名は版によって違う例が報告されているので順に試す。
+KEYCHAIN_SERVICES = ("Claude Code-credentials", "Claude Code")
+SECURITY_BIN = os.environ.get("TOKEN_PACE_SECURITY_BIN") or "security"
+
+
+def keychain_credentials():
+    """Keychain に入っている認証情報の JSON。読めなければ None。"""
+    if sys.platform != "darwin" and not os.environ.get("TOKEN_PACE_SECURITY_BIN"):
+        return None
+    for service in KEYCHAIN_SERVICES:
+        try:
+            p = subprocess.run([SECURITY_BIN, "find-generic-password", "-s", service, "-w"],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if p.returncode == 0 and p.stdout.strip():
+            try:
+                return json.loads(p.stdout.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return None
+    return None
+
+
+
 def access_token(now_epoch):
     """有効な OAuth アクセストークンを返す。無い/期限切れなら None。"""
     try:
         with open(CRED, "r", encoding="utf-8") as f:
             cred = json.load(f)
     except (OSError, ValueError):
-        return None          # macOS の Keychain 保管などファイルが無い環境では機能しない
+        cred = keychain_credentials()      # macOS はファイルが無く Keychain に入る
+        if not isinstance(cred, dict):
+            return None
     oauth = cred.get("claudeAiOauth")
     if not isinstance(oauth, dict):
         return None
@@ -130,16 +164,22 @@ def main():
     extra = body.get("extra_usage")
     if not isinstance(extra, dict):
         return                       # extra usage 非対応プラン/未提供
+    enabled = extra.get("is_enabled")      # 枠そのものの有無（金額とは独立）
     used, limit = extra.get("used_credits"), extra.get("monthly_limit")
-    if used is None or limit is None:
-        return
     try:
-        used, limit = round(float(used)), round(float(limit))
+        used = None if used is None else round(float(used))
+        limit = None if limit is None else round(float(limit))
     except (ValueError, TypeError):
-        return
+        used = limit = None
 
-    append_row({"ts": int(now_epoch), "used": used, "limit": limit,
-                "m1r": int(next_month_start(now_epoch))})
+    row = {"ts": int(now_epoch), "m1r": int(next_month_start(now_epoch))}
+    if used is not None and limit is not None:
+        row["used"], row["limit"] = used, limit
+    elif enabled is not False:
+        return      # 金額が取れず、枠の有無も分からない行は書かない
+    if isinstance(enabled, bool):
+        row["en"] = enabled
+    append_row(row)
 
 
 if __name__ == "__main__":

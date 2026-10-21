@@ -16,10 +16,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck install.sh uninstall.sh bootstrap.sh bin/serve.sh bin/sampler.sh test/smoke.sh
+        run: shellcheck install.sh uninstall.sh bootstrap.sh bin/serve.sh bin/tick.sh bin/scheduler.sh test/smoke.sh test/live-check.sh
       - name: bash -n syntax check
         run: |
-          for f in install.sh uninstall.sh bootstrap.sh bin/serve.sh bin/sampler.sh test/smoke.sh; do
+          for f in install.sh uninstall.sh bootstrap.sh bin/serve.sh bin/tick.sh bin/scheduler.sh test/smoke.sh test/live-check.sh; do
             bash -n "$f"
           done
 
@@ -40,6 +40,55 @@ jobs:
         run: |
           python -m pip install --quiet 'ruff==0.16.4'
           ruff check bin/
+
+  # 6) macOS の Keychain からの読み出し（実機の security コマンドで確かめる）
+  #    一時キーチェーンを作り、検索対象に加えて項目を入れ、bin/*.py が読めることを見る。
+  #    **限界**: ここで作る項目の ACL は security 自身のもの。実際に Claude Code が作った
+  #    項目を別プロセスが読むとき、Keychain の許可を求められるかどうかまでは確かめられない。
+  keychain:
+    name: keychain read (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: read credentials from a temporary keychain
+        run: |
+          set -eu
+          KC="$RUNNER_TEMP/tokenpace-ci.keychain-db"
+          TOKEN="KC-CI-TOKEN"
+          ORIG="$(security list-keychains -d user | tr -d '"' | xargs)"
+          cleanup() {
+            # shellcheck disable=SC2086
+            security list-keychains -d user -s $ORIG >/dev/null 2>&1 || true
+            security delete-keychain "$KC" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          security create-keychain -p tokenpace "$KC"
+          security unlock-keychain -p tokenpace "$KC"
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "$KC" $ORIG
+          security add-generic-password -s "Claude Code-credentials" -a claude-token-pace-ci \
+            -w "{\"claudeAiOauth\":{\"accessToken\":\"$TOKEN\",\"expiresAt\":99999999999999}}" "$KC"
+          cat > "$RUNNER_TEMP/read_token.py" <<'PY'
+          import importlib.util, sys, time
+          spec = importlib.util.spec_from_file_location("m", sys.argv[1])
+          m = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(m)
+          try:
+              print(m.access_token())
+          except TypeError:          # credits-fetch.py は now を取る
+              print(m.access_token(time.time()))
+          PY
+          for f in bin/usage-fetch.py bin/credits-fetch.py; do
+            got="$(CLAUDE_CONFIG_DIR="$RUNNER_TEMP/no-such-dir" python3 "$RUNNER_TEMP/read_token.py" "$f")"
+            if [ "$got" != "$TOKEN" ]; then
+              echo "FAIL: $f が Keychain から読めない (got: $got)" >&2
+              exit 1
+            fi
+            echo "OK: $f -> $got"
+          done
 
   # 1) インストール一気通貫スモークテスト
   # 2) ubuntu + macOS マトリクス、かつ install.sh 直叩き(direct) と

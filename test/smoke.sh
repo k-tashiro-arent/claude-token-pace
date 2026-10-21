@@ -2,8 +2,10 @@
 # claude-token-pace インストール一気通貫スモークテスト（CI / ローカル共用）。
 #
 # 隔離した一時 HOME に対して以下を検証する。実環境(~/.claude)には一切触れない:
-#   install → statusLine ラッパー化 → 記録(sampler) → pace.json 生成
+#   install → statusLine ラッパー化 → 記録(tick.sh: 定期実行と statusLine の 2 契機)
+#         → 定期実行の設置・点検・修理（systemctl / crontab は差し替え）→ pace.json 生成
 #         → serve.sh で / と /pace.json を配信 → 冪等性 → uninstall で復元
+# 最後に、実ユーザーの systemd timer・ユニットファイル・crontab が試験の前後で変わっていないことを検査する。
 #
 # 依存: bash / python3 / jq / curl。bash 3.2 (macOS 既定) でも動くよう配慮。
 set -euo pipefail
@@ -23,7 +25,49 @@ BOOT_REF="${SMOKE_BOOTSTRAP_REF:-main}"
 TMPHOME="$(mktemp -d 2>/dev/null || mktemp -d -t tokenpace)"
 if [ -z "$TMPHOME" ] || [ ! -d "$TMPHOME" ]; then echo "FATAL: mktemp -d failed"; exit 1; fi
 
+fail() { echo "❌ FAIL: $*" >&2; exit 1; }
+ok()   { echo "✅ $*"; }
+
+# --- uid に属する資源の不変検査 ---
+# systemd の user manager と crontab は uid 単位で、HOME を差し替えても隔離できない。
+# 試験がそれらに触っていないことを「主張」ではなく「検査」で確かめるため、
+# HOME を書き換える前に実ユーザー側の状態を写し取り、終了時に変わっていないかを見る。
+# （2026-10-20、試験が本物の timer を止めて 14.5 時間記録が欠測した事故の再発防止）
+# service の is-active は数秒おきに activating/inactive を行き来するので対象にしない。
+REAL_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+uid_snapshot() {
+  local out f
+  out="$(systemctl --user is-enabled claude-token-pace.timer 2>&1)" || true
+  printf 'timer is-enabled: %s\n' "$out"
+  out="$(systemctl --user is-active claude-token-pace.timer 2>&1)" || true
+  printf 'timer is-active: %s\n' "$out"
+  for f in claude-token-pace.timer claude-token-pace.service; do
+    if [ -f "$REAL_UNIT_DIR/$f" ]; then
+      printf '%s: %s\n' "$f" "$(cksum < "$REAL_UNIT_DIR/$f")"
+    else
+      printf '%s: (無し)\n' "$f"
+    fi
+  done
+  out="$(crontab -l 2>&1 | cksum)" || true
+  printf 'crontab -l: %s\n' "$out"
+}
+UID_BEFORE="$(uid_snapshot)"
+UID_CHECKED=""
+verify_uid_resources() {
+  local now
+  UID_CHECKED=1
+  now="$(uid_snapshot)"
+  if [ "$now" != "$UID_BEFORE" ]; then
+    echo "❌ FAIL: 試験が実ユーザーの systemd / crontab を変えた（HOME では隔離できない資源）" >&2
+    echo "--- 試験前" >&2; printf '%s\n' "$UID_BEFORE" >&2
+    echo "--- 試験後" >&2; printf '%s\n' "$now" >&2
+    return 1
+  fi
+}
+
 cleanup() {
+  # 途中で落ちた実行でも、実ユーザーの資源に触っていないかは必ず見る
+  if [ -z "$UID_CHECKED" ]; then verify_uid_resources || true; fi
   # 起動したテストサーバを確実に停止（本物の /tpw サーバは別 HOME なので無関係）
   if [ -n "${SRV_PID:-}" ]; then kill "$SRV_PID" 2>/dev/null || true; fi
   if [ -n "${TP_DIR:-}" ] && [ -r "$TP_DIR/.web_server" ]; then
@@ -36,12 +80,13 @@ cleanup() {
 trap cleanup EXIT
 
 export HOME="$TMPHOME"
+# 定期実行(systemd の user timer / cron)は実ユーザーの systemd・crontab を触るので設置しない。
+# あわせて XDG_CONFIG_HOME も一時 HOME に向け、実ユーザーのユニットを見に行かせない。
+export TOKEN_PACE_NO_SCHEDULER=1
+export XDG_CONFIG_HOME="$TMPHOME/.config"
 TP_DIR="$HOME/.claude/token-pace"
 SETTINGS="$HOME/.claude/settings.json"
 WRAPPER="$TP_DIR/bin/statusline-wrapper.sh"
-
-fail() { echo "❌ FAIL: $*" >&2; exit 1; }
-ok()   { echo "✅ $*"; }
 
 # 選択された経路でインストールする（direct / bootstrap 共通のエントリ）。
 # stdout は抑止するが stderr は残す（失敗時にエラーを見えるように）。
@@ -62,6 +107,20 @@ for op in powershell.exe xdg-open open; do
 done
 export PATH="$HOME/fakebin:$PATH"
 
+# 使用量 API へは実通信しない。応答はローカルの canned JSON を file:// で読ませる
+# （リセット時刻は now 相対にして、記録が窓内に入るようにする）
+UJSON="$TMPHOME/usage.json"
+python3 - "$UJSON" <<'PY'
+import datetime, json, sys, time
+now = int(time.time())
+def iso(t):
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+json.dump({"five_hour": {"utilization": 62, "resets_at": iso(now + 3600)},
+           "seven_day": {"utilization": 41, "resets_at": iso(now + 3 * 86400)}},
+          open(sys.argv[1], "w"))
+PY
+export TOKEN_PACE_USAGE_URL="file://$UJSON"
+
 # 既存 statusLine を仕込む（ラッパーがこれを転送することを検証するため）
 jq -n '{statusLine:{type:"command",command:"echo ORIG-STATUSLINE-OK"}}' > "$SETTINGS"
 
@@ -71,55 +130,308 @@ else
   echo "== smoke: HOME=$HOME  mode=direct =="
 fi
 
+# 0) 版表記の一致: VERSION と README 冒頭の版表記がずれると、読者はどの版の README か
+#    判断できない。release-guard.yml はタグ push 時に VERSION とタグ名しか見ないので、
+#    README とのずれを検出できるのはここだけ。
+ver="$(tr -d '[:space:]' < "$REPO/VERSION")"
+[ -n "$ver" ] || fail "VERSION ファイルが空"
+for rd in README.md README.en.md; do
+  [ -f "$REPO/$rd" ] || fail "$rd が無い"
+  # 冒頭 10 行から最初の **x.y.z** を取る（本文の太字に数字が来ても拾わない形）
+  shown="$(sed -n '1,10p' "$REPO/$rd" \
+           | sed -n 's/.*\*\*\([0-9][0-9.]*\)\*\*.*/\1/p' | head -1)"
+  [ -n "$shown" ] || fail "$rd の冒頭に版表記（**x.y.z**）が見つからない"
+  [ "$shown" = "$ver" ] \
+    || fail "$rd の版表記 ($shown) が VERSION ($ver) と一致しない。どちらかを揃えること"
+done
+ok "版表記の一致: VERSION=$ver と README.md / README.en.md の冒頭が一致"
+
 # 1) install（direct=install.sh / bootstrap=curl ワンライナー経路）
 do_install || fail "インストール($MODE) が非ゼロ終了"
 [ -x "$TP_DIR/bin/serve.sh" ]    || fail "serve.sh 未配置"
-[ -x "$TP_DIR/bin/sampler.sh" ]  || fail "sampler.sh 未配置"
+[ -x "$TP_DIR/bin/usage-fetch.py" ] || fail "usage-fetch.py 未配置"
+[ -x "$TP_DIR/bin/tick.sh" ]     || fail "tick.sh 未配置"
+[ ! -e "$TP_DIR/bin/sampler.sh" ] || fail "statusLine 用の sampler.sh が残っている"
 [ -x "$TP_DIR/bin/pace-json.py" ]|| fail "pace-json.py 未配置"
 [ -f "$TP_DIR/bin/serve-http.py" ]|| fail "serve-http.py 未配置"
 [ -x "$TP_DIR/bin/credits-fetch.py" ] || fail "credits-fetch.py 未配置"
 [ -x "$TP_DIR/bin/codex-scan.py" ] || fail "codex-scan.py 未配置"
 [ -f "$TP_DIR/index.html" ]      || fail "index.html 未配置"
 [ -f "$HOME/.claude/commands/tpw.md" ] || fail "/tpw コマンド未設置"
-got_wrap="$(jq -r '.statusLine.command' "$SETTINGS")"
-[ "$got_wrap" = "$WRAPPER" ] || fail "statusLine がラッパー化されていない (got: $got_wrap)"
-[ "$(cat "$TP_DIR/.orig_statusline")" = "echo ORIG-STATUSLINE-OK" ] || fail "元 statusLine が保存されていない"
-ok "install($MODE): ファイル配置・statusLine ラッパー化・元コマンド保存"
+[ -x "$TP_DIR/bin/scheduler.sh" ] || fail "scheduler.sh 未配置"
+[ -x "$WRAPPER" ] || fail "statusLine ラッパーが作られない"
+got_sl="$(jq -r '.statusLine.command' "$SETTINGS")"
+[ "$got_sl" = "$WRAPPER" ] || fail "statusLine がラッパーを指していない (got: $got_sl)"
+[ "$(cat "$TP_DIR/.orig_statusline")" = "echo ORIG-STATUSLINE-OK" ] || fail "元の statusLine が保存されていない"
+[ "$(cat "$TP_DIR/.scheduler")" = "none" ] || fail "TOKEN_PACE_NO_SCHEDULER が効いていない"
+! grep -q 'sampler' "$WRAPPER" || fail "ラッパーが旧版の sampler.sh を呼んでいる"
+ok "install($MODE): ファイル配置・/tpw 設置・statusLine をラッパーに差し替え（元は保存）"
 
-# 2) 実際の statusLine JSON（resets_at は now 相対にしてサンプルが窓内に入るようにする）
-now="$(date +%s)"
-five="$((now + 3600))"; seven="$((now + 3 * 86400))"
-JSON="$(jq -n --argjson f "$five" --argjson s "$seven" '{
-  context_window:{total_input_tokens:120000,total_output_tokens:8000,used_percentage:34},
-  cost:{total_cost_usd:12.34},
-  model:{display_name:"Opus 4.8",id:"claude-opus-4-8"},
-  effort:{level:"high"},thinking:{enabled:false},fast_mode:false,
-  cwd:"/tmp",
-  rate_limits:{five_hour:{used_percentage:62,resets_at:$f},
-               seven_day:{used_percentage:41,resets_at:$s}},
-  session_id:"ci-smoke"}')"
-
-# 3) ラッパー発火（元 statusLine の転送 ＋ サンプリング起動を一度に検証）
-out="$(printf '%s' "$JSON" | bash "$WRAPPER")"
-case "$out" in
-  *ORIG-STATUSLINE-OK*) ok "ラッパーが元 statusLine 表示を転送" ;;
-  *) fail "ラッパーが元 statusLine を転送しない (got: $out)" ;;
-esac
-
-# 4) 記録の確認（ラッパーは sampler をバックグラウンド実行するので固定 sleep せずポーリング）
-deadline="$((now + 20))"
-rows=0
-while [ "$(date +%s)" -le "$deadline" ]; do
-  if [ -f "$TP_DIR/pace.jsonl" ]; then
-    rows="$(wc -l < "$TP_DIR/pace.jsonl" 2>/dev/null | tr -d '[:space:]')"
-    [ -n "$rows" ] && [ "$rows" -ge 1 ] && break
-  fi
-  sleep 0.3
-done
-if [ -z "$rows" ] || [ "$rows" -lt 1 ]; then fail "20秒以内に pace.jsonl へ記録されなかった"; fi
-tail -1 "$TP_DIR/pace.jsonl" | jq -e 'has("ts") and has("h5") and has("d7")' >/dev/null \
+# 2) 記録は定期実行の経路だけで行う（tick.sh = timer / cron から呼ばれる入口）
+now_t="$(date +%s)"
+printf '%s' "$now_t" > "$TP_DIR/.last_credits"   # 月次と Codex はこのケースの対象外
+printf '%s' "$now_t" > "$TP_DIR/.last_codex"
+bash "$TP_DIR/bin/tick.sh" || fail "tick.sh が非ゼロ終了"
+[ -s "$TP_DIR/pace.jsonl" ] || fail "tick.sh が pace.jsonl に記録しない"
+tail -1 "$TP_DIR/pace.jsonl" | jq -e '.src=="api" and has("ts") and has("h5") and has("d7")' >/dev/null \
   || fail "記録行に必要フィールドが無い"
-ok "sampler が有効な行を記録 (pace.jsonl=$rows 行)"
+rows="$(wc -l < "$TP_DIR/pace.jsonl" 2>/dev/null | tr -d '[:space:]')"
+grep -q ' usage 記録した（契機=manual）$' "$TP_DIR/tick.log" || fail "tick.log に実行の記録が残らない（切り分けできない）"
+ok "定期実行の入口 tick.sh が API 応答から記録し、tick.log に結果を残す (pace.jsonl=$rows 行)"
+
+# 3a) 0.3.0 以前からの更新: statusLine がすでに（sampler.sh を呼ぶ）旧ラッパーを指していても、
+#     ラッパーの中身は新しくなり、保存済みの元の statusLine は上書きされない
+printf '#!/usr/bin/env bash\nbash "%s/bin/sampler.sh" &\n' "$TP_DIR" > "$WRAPPER"
+do_install || fail "旧ラッパーからの更新が失敗"
+! grep -q 'sampler' "$WRAPPER" || fail "旧ラッパーの中身が置き換わらない"
+[ "$(jq -r '.statusLine.command' "$SETTINGS")" = "$WRAPPER" ] || fail "旧ラッパーからの更新で statusLine が変わった"
+[ "$(cat "$TP_DIR/.orig_statusline")" = "echo ORIG-STATUSLINE-OK" ] || fail "旧ラッパーからの更新で元の statusLine を上書きした"
+ok "0.3.0 以前からの更新: 旧ラッパーを置き換え、元の statusLine は保持"
+
+# 3) statusLine の契機: ラッパーは元の statusLine の出力をそのまま返し、
+#    記録（tick.sh --from statusline）を切り離して蹴る。1 分以内の再呼び出しでは蹴らない
+rm -f "$TP_DIR/.last_usage" "$TP_DIR/.last_statusline"
+printf '%s' "$now_t" > "$TP_DIR/.last_plot"      # このケースでは usage の記録だけを見る
+rows0="$(wc -l < "$TP_DIR/pace.jsonl" | tr -d '[:space:]')"
+sl_out="$(echo '{"session_id":"smoke"}' | bash "$WRAPPER")"
+[ "$sl_out" = "ORIG-STATUSLINE-OK" ] || fail "ラッパーが元の statusLine の出力を返さない (got: $sl_out)"
+i=0
+until grep -q ' usage 記録した（契機=statusline）$' "$TP_DIR/tick.log"; do
+  i=$((i + 1)); [ "$i" -le 30 ] || fail "statusLine の契機で tick.sh が記録しない"
+  sleep 0.5
+done
+rows1="$(wc -l < "$TP_DIR/pace.jsonl" | tr -d '[:space:]')"
+[ "$rows1" -eq $((rows0 + 1)) ] || fail "statusLine の契機で 1 行記録されない ($rows0 → $rows1)"
+tail -1 "$TP_DIR/pace.jsonl" | jq -e '.src=="api"' >/dev/null || fail "statusLine の契機でも API から取得すること"
+stamp1="$(cat "$TP_DIR/.last_statusline")"
+echo '{}' | bash "$WRAPPER" >/dev/null
+[ "$(cat "$TP_DIR/.last_statusline")" = "$stamp1" ] || fail "1 分以内の statusLine で再び tick を蹴った"
+ok "statusLine の契機: 元の出力を返し、tick.sh を蹴って API から記録・1 分以内は蹴らない"
+
+# 3k) macOS の Keychain 読み出し: security を差し替えて、ファイルが無くても認証情報を読めること、
+#     ファイルがあればそちらが優先されること、security が失敗したらトークン無しとして扱うことを見る
+KCDIR="$HOME/kc"; mkdir -p "$KCDIR/bin" "$KCDIR/empty" "$KCDIR/withfile"
+cat > "$KCDIR/bin/security" <<'KCEOF'
+#!/bin/sh
+[ "$1" = "find-generic-password" ] || exit 1
+case "$3" in
+  "Claude Code-credentials") echo '{"claudeAiOauth":{"accessToken":"KC-TOKEN","expiresAt":99999999999999}}'; exit 0 ;;
+  *) exit 44 ;;
+esac
+KCEOF
+printf '#!/bin/sh\nexit 44\n' > "$KCDIR/bin/security-fail"
+chmod +x "$KCDIR/bin/security" "$KCDIR/bin/security-fail"
+printf '%s\n' '{"claudeAiOauth":{"accessToken":"FILE-TOKEN","expiresAt":99999999999999}}' \
+  > "$KCDIR/withfile/.credentials.json"
+read_token() {   # read_token <スクリプト> <security の実体> <CLAUDE_CONFIG_DIR>
+  TOKEN_PACE_SECURITY_BIN="$2" CLAUDE_CONFIG_DIR="$3" python3 - "$TP_DIR/bin/$1" <<'KCPY'
+import importlib.util, sys, time
+spec = importlib.util.spec_from_file_location("m", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+try:
+    print(m.access_token())
+except TypeError:            # credits-fetch.py は now を取る
+    print(m.access_token(time.time()))
+KCPY
+}
+for f in usage-fetch.py credits-fetch.py; do
+  got="$(read_token "$f" "$KCDIR/bin/security" "$KCDIR/empty")"
+  [ "$got" = "KC-TOKEN" ] || fail "$f が Keychain から読めない (got: $got)"
+  got="$(read_token "$f" "$KCDIR/bin/security" "$KCDIR/withfile")"
+  [ "$got" = "FILE-TOKEN" ] || fail "$f がファイルより Keychain を優先した (got: $got)"
+  got="$(read_token "$f" "$KCDIR/bin/security-fail" "$KCDIR/empty")"
+  [ "$got" = "None" ] || fail "$f が Keychain 読み出し失敗を None にしない (got: $got)"
+done
+ok "macOS の Keychain: ファイルが無ければ security から読み、ファイルがあれば優先、失敗はトークン無し"
+
+# 3s) スケジューラの設置: systemctl / loginctl / crontab を差し替えて、
+#     生成されるユニット本文と cron 行だけを検証する（実ユーザーの systemd・crontab は触らない）。
+#     systemctl の差し替えは状態を持ち（enable/restart/disable を覚える）、show が返す
+#     ExecStart は差し替え先のユニットファイルの中身から作る（loaded_exec があればそちらを返す）
+STUB="$HOME/stubbin"; SD="$HOME/xdg"; CALLS="$HOME/sched-calls.txt"; CRONF="$HOME/crontab.txt"
+SDST="$HOME/sdstate"
+mkdir -p "$STUB" "$SD" "$SDST"; : > "$CALLS"; : > "$CRONF"
+cat > "$STUB/systemctl" <<EOF
+#!/bin/sh
+echo "systemctl \$*" >> "$CALLS"
+SVCF="$SD/systemd/user/claude-token-pace.service"
+case "\$*" in
+  *show-environment*) [ -n "\${SYSTEMD_STUB_FAIL:-}" ] && exit 1; exit 0 ;;
+  *"show -p ExecStart"*)
+    if [ -f "$SDST/loaded_exec" ]; then cat "$SDST/loaded_exec"
+    elif [ -f "\$SVCF" ]; then sed -n 's|^ExecStart=\(.*\)|ExecStart={ path=/usr/bin/env ; argv[]=\1 ; ignore_errors=no }|p' "\$SVCF"; fi
+    exit 0 ;;
+  *"show -p LoadState"*) if [ -f "\$SVCF" ] || [ -f "$SDST/loaded_exec" ]; then echo loaded; else echo not-found; fi; exit 0 ;;
+  *is-enabled*) v=\$(cat "$SDST/enabled" 2>/dev/null || echo disabled); echo "\$v"; [ "\$v" = enabled ]; exit \$? ;;
+  *is-active*)  v=\$(cat "$SDST/active" 2>/dev/null || echo inactive); echo "\$v"; [ "\$v" = active ]; exit \$? ;;
+  *"disable --now"*) echo disabled > "$SDST/enabled"; echo inactive > "$SDST/active" ;;
+  *" enable "*) echo enabled > "$SDST/enabled" ;;
+  *restart*) echo active > "$SDST/active" ;;
+esac
+exit 0
+EOF
+cat > "$STUB/loginctl" <<EOF
+#!/bin/sh
+echo "loginctl \$*" >> "$CALLS"
+exit 0
+EOF
+cat > "$STUB/crontab" <<EOF
+#!/bin/sh
+echo "crontab \$*" >> "$CALLS"
+if [ "\$1" = "-l" ]; then
+  [ -n "\${CRONTAB_STUB_FAIL:-}" ] && { echo "crontab: cannot connect" >&2; exit 1; }
+  cat "$CRONF"; exit 0
+fi
+cat > "$CRONF"
+exit 0
+EOF
+chmod +x "$STUB/systemctl" "$STUB/loginctl" "$STUB/crontab"
+PY_DIR="$(dirname "$(command -v python3)")"
+TICK="$TP_DIR/bin/tick.sh"
+UNIT="$SD/systemd/user/claude-token-pace.timer"; SVC="$SD/systemd/user/claude-token-pace.service"
+# スタブ環境で動かす（定期実行を設置させるため TOKEN_PACE_NO_SCHEDULER は外す）
+stubenv() { env -u TOKEN_PACE_NO_SCHEDULER PATH="$STUB:$PATH" XDG_CONFIG_HOME="$SD" "$@"; }
+sched() { stubenv bash "$TP_DIR/bin/scheduler.sh" "$@"; }
+# 状態を変える systemctl / crontab の呼び出しがあったか（CALLS を空にしてから使う）
+mutated() { grep -E 'systemctl --user (enable|disable|restart|start|stop|daemon-reload)|^crontab -$' "$CALLS"; }
+
+# 3s-1) systemd 経路
+stubenv bash "$REPO/install.sh" >/dev/null || fail "スタブ環境の install(systemd) が失敗"
+[ -f "$UNIT" ] && [ -f "$SVC" ] || fail "systemd のユニットが生成されない"
+grep -q '^OnUnitActiveSec=5min$' "$UNIT" || fail "timer の間隔が 5min でない: $(grep -c . "$UNIT") 行"
+! grep -q '^Persistent=' "$UNIT" || fail "monotonic timer に効かない Persistent= が残っている"
+grep -q "^Environment=TOKEN_PACE_DIR=$TP_DIR\$" "$SVC" || fail "service に TOKEN_PACE_DIR が無い"
+grep -q "^ExecStart=.* $TICK --from timer\$" "$SVC" || fail "service の ExecStart が tick.sh --from timer でない"
+grep -q "^Environment=PATH=.*$PY_DIR" "$SVC" || fail "service の PATH に python3 の場所が無い"
+grep -q 'systemctl --user restart claude-token-pace.timer' "$CALLS" \
+  || fail "間隔の変更が効くよう timer を restart していない"
+[ "$(cat "$TP_DIR/.scheduler")" = "systemd" ] || fail ".scheduler が systemd でない"
+cmp -s "$SVC" "$TP_DIR/sched/claude-token-pace.service" || fail "設置内容の控えがユニットと一致しない"
+
+# 3s-2) 間隔の指定: 分は通る / 分以外は既定 5min に落として cron の分指定を壊さない
+stubenv TOKEN_PACE_INTERVAL=10min bash "$REPO/install.sh" >/dev/null || fail "間隔 10min の install が失敗"
+grep -q '^OnUnitActiveSec=10min$' "$UNIT" || fail "TOKEN_PACE_INTERVAL=10min が反映されない"
+stubenv TOKEN_PACE_INTERVAL=1h bash "$REPO/install.sh" >/dev/null 2>&1 || fail "間隔 1h の install が失敗"
+grep -q '^OnUnitActiveSec=5min$' "$UNIT" || fail "分以外の指定が既定 5min に落ちない（cron の分指定が壊れる）"
+
+# 3h) 点検と修理（statusLine の契機で tick.sh が呼ぶ scheduler.sh check --repair）
+# 3h-1) 正常なら何も変えない
+: > "$CALLS"
+sched check --repair >/dev/null || fail "正常な設置を異常と判定した"
+! mutated >/dev/null || fail "正常なのに systemd / crontab を変更した: $(mutated | head -1)"
+# 3h-2) --repair なしでは、異常があっても何も変えない
+echo disabled > "$SDST/enabled"; echo inactive > "$SDST/active"; : > "$CALLS"
+if sched check >/dev/null; then fail "止まった timer を正常と判定した"; fi
+! mutated >/dev/null || fail "--repair なしで変更した: $(mutated | head -1)"
+# 3h-3) --repair で enable と restart をする
+out="$(sched check --repair)" && fail "修理した回の終了コードが 0（異常があったことが伝わらない）"
+[ "$(cat "$SDST/enabled")/$(cat "$SDST/active")" = "enabled/active" ] || fail "修理後も timer が有効・動作中でない: $out"
+sched check >/dev/null || fail "修理後の点検が正常にならない"
+# 3h-4) ユニットファイルが消えていたら控えから戻して daemon-reload する
+rm -f "$UNIT"; : > "$CALLS"
+sched check --repair >/dev/null && fail "ユニットが無いのを正常と判定した"
+cmp -s "$UNIT" "$TP_DIR/sched/claude-token-pace.timer" || fail "消えたユニットを控えから戻さない"
+grep -q 'systemctl --user daemon-reload' "$CALLS" || fail "ユニットを戻したあと daemon-reload しない"
+# 3h-5) timer から長く起動されていなければ restart する（設置・修理の直後は待つ）
+printf '%s' "$((now_t - 7200))" > "$TP_DIR/.last_timer_tick"
+printf '%s' "$((now_t - 7200))" > "$TP_DIR/sched/installed_at"
+rm -f "$TP_DIR/sched/repaired_at"; : > "$CALLS"
+out="$(sched check --repair)" && fail "timer が 2 時間起動されていないのを正常と判定した"
+case "$out" in *"起動されていない"*) : ;; *) fail "起動されていないことを出力しない: $out" ;; esac
+grep -q 'systemctl --user restart claude-token-pace.timer' "$CALLS" || fail "起動されていない timer を restart しない"
+sched check >/dev/null || fail "restart の直後にまた異常と判定した（修理を繰り返してしまう）"
+# 3h-6) ユニットファイルが別の設置先を指していたら、異常でも触らない
+cp "$SVC" "$HOME/svc.keep"
+sed 's|^ExecStart=.*|ExecStart=/usr/bin/env bash /somewhere/else/bin/tick.sh --from timer|' "$HOME/svc.keep" > "$SVC"
+echo disabled > "$SDST/enabled"; : > "$CALLS"
+out="$(sched check --repair)" && fail "別の設置先のユニットを正常と判定した"
+! mutated >/dev/null || fail "別の設置先のユニットを変更した: $(mutated | head -1)"
+grep -q '/somewhere/else/' "$SVC" || fail "別の設置先のユニットファイルを書き換えた"
+#      読み込み済みのユニットがこちらを指していても、ファイルが別の設置先なら書き換えない
+printf 'ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env bash %s --from timer ; }\n' "$TICK" > "$SDST/loaded_exec"
+: > "$CALLS"
+sched check --repair >/dev/null && fail "別の設置先のユニットファイルを正常と判定した"
+! mutated >/dev/null || fail "別の設置先のユニットファイルがあるのに変更した: $(mutated | head -1)"
+grep -q '/somewhere/else/' "$SVC" || fail "別の設置先のユニットファイルを書き換えた（読み込み済みはこちら）"
+rm -f "$SDST/loaded_exec"
+# 3h-7) systemd が読み込んでいるユニットが別の設置先なら触らない（ファイルだけでは所有を決めない）
+cp "$HOME/svc.keep" "$SVC"
+printf 'ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env bash /somewhere/else/bin/tick.sh ; }\n' > "$SDST/loaded_exec"
+rm -f "$UNIT"; : > "$CALLS"
+sched check --repair >/dev/null && fail "読み込み済みのユニットが別の設置先なのを正常と判定した"
+! mutated >/dev/null || fail "別の設置先が読み込まれているのに変更した: $(mutated | head -1)"
+rm -f "$SDST/loaded_exec"; cp "$TP_DIR/sched/claude-token-pace.timer" "$UNIT"; echo enabled > "$SDST/enabled"
+# 3h-8) statusLine の契機の tick.sh が点検・修理し、結果を tick.log に残す（10 分に 1 回まで）
+echo inactive > "$SDST/active"; rm -f "$TP_DIR/.last_sched_check"
+stubenv bash "$TICK" --from statusline || fail "tick.sh --from statusline が失敗"
+[ "$(cat "$SDST/active")" = "active" ] || fail "statusLine の契機で止まった timer を直さない"
+grep -q ' scheduler .*is-active=inactive' "$TP_DIR/tick.log" || fail "点検の結果が tick.log に残らない"
+echo inactive > "$SDST/active"
+stubenv bash "$TICK" --from statusline || fail "tick.sh --from statusline（2 回目）が失敗"
+[ "$(cat "$SDST/active")" = "inactive" ] || fail "10 分以内に再び点検した（statusLine ごとに systemctl を叩く）"
+echo active > "$SDST/active"
+# 3h-9) timer の契機では起動時刻を残す（点検が「timer が動いている」と判断する根拠）
+rm -f "$TP_DIR/.last_timer_tick"
+stubenv bash "$TICK" --from timer || fail "tick.sh --from timer が失敗"
+[ -s "$TP_DIR/.last_timer_tick" ] || fail "timer の契機で起動時刻を残さない"
+# 3h-10) 未設置（.scheduler=none）なら点検しない
+printf 'none\n' > "$TP_DIR/.scheduler"; : > "$CALLS"
+sched check --repair >/dev/null || fail "未設置を異常と判定した"
+[ ! -s "$CALLS" ] || fail "未設置なのに systemctl / crontab を呼んだ: $(head -1 "$CALLS")"
+printf 'systemd\n' > "$TP_DIR/.scheduler"
+
+# 3s-3) cron 経路（systemd が使えない環境）。以前 systemd で入れた自分の登録は外す
+stubenv SYSTEMD_STUB_FAIL=1 bash "$REPO/install.sh" >/dev/null || fail "スタブ環境の install(cron) が失敗"
+[ "$(cat "$TP_DIR/.scheduler")" = "cron" ] || fail ".scheduler が cron でない"
+cronline="$(grep '# claude-token-pace$' "$CRONF" || true)"
+case "$cronline" in
+  "*/5 * * * * PATH="*"TOKEN_PACE_DIR=\"$TP_DIR\" bash \"$TICK\" --from timer >/dev/null 2>&1 # claude-token-pace") : ;;
+  *) fail "cron 行が不正: $cronline" ;;
+esac
+case "$cronline" in *"PATH=\""*"$PY_DIR"*) : ;; *) fail "cron 行の PATH に python3 の場所が無い: $cronline" ;; esac
+[ ! -f "$SVC" ] || fail "cron に切り替えたのに systemd のユニットが残っている（二重に動く）"
+# 3c) cron の点検と修理: 自分の行が消えていたら戻す。別の設置先の行は残す。読めなければ書かない
+other="*/5 * * * * bash \"/somewhere/else/bin/tick.sh\" # claude-token-pace"
+printf '%s\n%s\n' "MAILTO=\"\"" "$other" > "$CRONF"
+sched check --repair >/dev/null && fail "cron 行が無いのを正常と判定した"
+grep -q -F -x "$cronline" "$CRONF" || fail "消えた cron 行を戻さない"
+grep -q -F -x "$other" "$CRONF" || fail "別の設置先の cron 行を消した"
+grep -q -F -x 'MAILTO=""' "$CRONF" || fail "利用者の crontab の行を消した"
+sched check >/dev/null || fail "cron の修理後の点検が正常にならない"
+grep -v -F -x "$cronline" "$CRONF" > "$CRONF.n"; mv "$CRONF.n" "$CRONF"; cp "$CRONF" "$HOME/cron.keep"; : > "$CALLS"
+stubenv CRONTAB_STUB_FAIL=1 bash "$TP_DIR/bin/scheduler.sh" check --repair >/dev/null && fail "crontab が読めないのを正常と判定した"
+! grep -q '^crontab -$' "$CALLS" || fail "crontab が読めないのに書き戻した（空で上書きしてしまう）"
+cmp -s "$CRONF" "$HOME/cron.keep" || fail "crontab が読めないのに中身が変わった"
+
+# 3s-4) 解除: uninstall がこの設置先の cron 行を消す（別の設置先の行は残す）
+sched check --repair >/dev/null || true
+PATH="$STUB:$PATH" XDG_CONFIG_HOME="$SD" bash "$TP_DIR/uninstall.sh" >/dev/null || fail "uninstall(cron) が失敗"
+! grep -q -F "\"$TICK\"" "$CRONF" || fail "uninstall が cron 行を消さない"
+grep -q -F -x "$other" "$CRONF" || fail "uninstall が別の設置先の cron 行を消した"
+
+# 3s-5) TOKEN_PACE_NO_SCHEDULER=1 は、以前の自分の登録（timer と cron 行）を撤去してから none にする
+stubenv bash "$REPO/install.sh" >/dev/null || fail "撤去試験の準備(systemd) が失敗"
+printf '%s\n' "*/5 * * * * TOKEN_PACE_DIR=\"$TP_DIR\" bash \"$TICK\" >/dev/null 2>&1 # claude-token-pace" >> "$CRONF"
+: > "$CALLS"
+PATH="$STUB:$PATH" XDG_CONFIG_HOME="$SD" bash "$REPO/install.sh" >/dev/null || fail "NO_SCHEDULER の install が失敗"
+[ "$(cat "$TP_DIR/.scheduler")" = "none" ] || fail ".scheduler が none でない"
+! grep -q -F "\"$TICK\"" "$CRONF" || fail "NO_SCHEDULER の install が既存の cron 行を残した"
+grep -q -F -x "$other" "$CRONF" || fail "NO_SCHEDULER の install が別の設置先の cron 行を消した"
+grep -q 'systemctl --user disable --now claude-token-pace.timer' "$CALLS" \
+  || fail "NO_SCHEDULER の install が既存の timer を無効化していない"
+[ ! -f "$UNIT" ] || fail "NO_SCHEDULER の install がユニットを残した"
+# 3s-6) 別の設置先を指す登録は触らない（NO_SCHEDULER の撤去が実環境の timer を止めないための歯止め）
+: > "$CALLS"
+mkdir -p "$SD/systemd/user"
+printf 'ExecStart=/usr/bin/env bash /somewhere/else/bin/tick.sh\n' > "$SVC"
+printf '[Timer]\nOnUnitActiveSec=5min\n' > "$UNIT"
+PATH="$STUB:$PATH" XDG_CONFIG_HOME="$SD" bash "$REPO/install.sh" >/dev/null \
+  || fail "別の設置先が登録されている状態の install が失敗"
+! grep -q 'systemctl --user disable' "$CALLS" \
+  || fail "別の設置先を指す timer を止めた（実環境の定期実行を止めてしまう）"
+[ -f "$SVC" ] || fail "別の設置先のユニットを消した"
+rm -f "$SVC" "$UNIT"
+ok "スケジューラ: ユニット/cron 行の中身・間隔・点検と修理（timer 停止・ユニット消失・起動途絶・cron 行消失）・解除・NO_SCHEDULER での撤去・別設置先には触らない"
 
 # 5) pace-json.py が妥当な pace.json を生成
 python3 "$TP_DIR/bin/pace-json.py" || fail "pace-json.py が非ゼロ終了"
@@ -189,9 +501,40 @@ jq -e '(.panels[1].used | map(.[1]) | max) < 20 and .panels[1].used_now < 20' "$
   || fail "stale回帰: 古いスナップショット(d7=40)が除外されずスパイク (7d系列最大=$maxd7, used_now=$un7, 期待<20)"
 ok "stale スナップショット除外: h5r<=ts の古い行(d7=40)を弾き 7d はスパイクせず (系列最大=$maxd7)"
 
-# 5p) プレイバック回帰(5h): 直近7dに重なる 5h 窓が seg5h として並び、窓の切替＝リセットが再現される。
+# 5o) 古い窓のスナップショット回帰: h5r が観測時点より未来でも、いったん観測した h5r より
+#     古い窓を報告する行は別の（古い）窓のスナップショット。_stale では弾けないので
+#     mark_old_window が印を付ける。実測（2026-10-20 12:51:43）では h5=0/d7=100 の 1 行が
+#     7d を 9% から 100% へ跳ねさせた。その行が除外されることを検証する。
+ODIR="$HOME/oldwin-test"
+mkdir -p "$ODIR"
+python3 - "$ODIR/pace.jsonl" <<'PY'
+import json, sys, time
+now = int(time.time())
+h5r_cur = now + 3600          # いま観測している 5h 窓
+h5r_prev = now + 600          # それより古い窓（ただし観測時点より未来なので _stale は弾けない）
+d7r = now + 3 * 86400         # 7d 窓は現窓と一致する（ここがスパイクの原因）
+d7 = [5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 9, 10, 10, 10]
+h5 = [40, 42, 45, 48, 50, 52, 55, 58, 60, 62, 65, 68, 70, 72]
+n = len(d7)
+rows = [{"ts": now - (n - i) * 60, "h5": h5[i], "h5r": h5r_cur,
+         "d7": d7[i], "d7r": d7r, "sid": "fresh"} for i in range(n)]
+# 古い窓のスナップショット: h5=0 / d7=100、h5r は前の窓（未来だが後退している）
+rows.append({"ts": now - (n // 2) * 60, "h5": 0, "h5r": h5r_prev,
+             "d7": 100, "d7r": d7r, "sid": "oldwin"})
+rows.sort(key=lambda r: r["ts"])
+with open(sys.argv[1], "w") as f:
+    for r in rows:
+        f.write(json.dumps(r) + "\n")
+PY
+TOKEN_PACE_DIR="$ODIR" python3 "$TP_DIR/bin/pace-json.py" || fail "古い窓回帰: pace-json.py が非ゼロ終了"
+maxo7="$(jq -r '.panels[1].used | map(.[1]) | max' "$ODIR/pace.json")"
+jq -e '(.panels[1].used | map(.[1]) | max) < 20' "$ODIR/pace.json" >/dev/null \
+  || fail "古い窓回帰: h5r が後退した行(d7=100)が除外されずスパイク (7d系列最大=$maxo7, 期待<20)"
+ok "古い窓のスナップショット除外: h5r が後退した行(d7=100)を弾き 7d はスパイクせず (系列最大=$maxo7)"
+
+# 5p) プレイバック回帰(5h): 直近7dに重なる 5h 窓が playback.segs["5h"] として並び、窓の切替＝リセットが再現される。
 #     連続する 2 つの 5h 窓（前窓 h5 が 90 まで上昇 → 現窓は 5 から再上昇）を用意し、
-#     seg5h が古い順に 2 セグメント／後段セグメントが低値から始まる（リセット再現）ことを検証。
+#     segs["5h"] が古い順に 2 セグメント／後段セグメントが低値から始まる（リセット再現）ことを検証。
 PDIR="$HOME/playback-test"
 mkdir -p "$PDIR"
 python3 - "$PDIR/pace.jsonl" <<'PY'
@@ -214,23 +557,24 @@ with open(sys.argv[1], "w") as f:
         f.write(json.dumps(r) + "\n")
 PY
 TOKEN_PACE_DIR="$PDIR" python3 "$TP_DIR/bin/pace-json.py" || fail "playback回帰: pace-json.py が非ゼロ終了"
-jq -e 'has("playback") and (.playback | has("start") and has("now") and has("seg5h"))' "$PDIR/pace.json" >/dev/null \
-  || fail "playback回帰: playback(start/now/seg5h) が無い"
-jq -e '.playback.seg5h | length == 2' "$PDIR/pace.json" >/dev/null \
-  || fail "playback回帰: seg5h が 2 セグメントでない (len=$(jq -r '.playback.seg5h|length' "$PDIR/pace.json"))"
-jq -e '.playback.seg5h | all(has("x0") and has("x1") and has("even") and has("used") and has("reset_label") and (.xmode=="time"))' \
+jq -e 'has("playback") and (.playback | has("start") and has("now") and has("segs"))' "$PDIR/pace.json" >/dev/null \
+  || fail "playback回帰: playback(start/now/segs) が無い"
+jq -e '.playback.segs["5h"] | length == 2' "$PDIR/pace.json" >/dev/null \
+  || fail "playback回帰: segs[\"5h\"] が 2 セグメントでない (len=$(jq -r '.playback.segs["5h"]|length' "$PDIR/pace.json"))"
+jq -e '.playback.segs["5h"] | all(has("x0") and has("x1") and has("even") and has("used") and has("reset_label") and (.xmode=="time"))' \
   "$PDIR/pace.json" >/dev/null || fail "playback回帰: 5h seg に必須キー欠落 or xmode!=time"
-jq -e '(.playback.seg7d | length >= 1) and (.playback.seg7d | all(has("x0") and has("x1") and has("even") and has("used") and (.xmode=="date")))' \
-  "$PDIR/pace.json" >/dev/null || fail "playback回帰: seg7d が無い or 必須キー欠落 or xmode!=date"
-segmax="$(jq -r '.playback.seg5h[0].used | map(.[1]) | max' "$PDIR/pace.json")"
-segb0="$(jq -r '.playback.seg5h[1].used[0][1]' "$PDIR/pace.json")"
-jq -e '(.playback.seg5h[0].used | map(.[1]) | max) >= 80' "$PDIR/pace.json" >/dev/null \
+jq -e '(.playback.segs["7d"] | length >= 1) and (.playback.segs["7d"] | all(has("x0") and has("x1") and has("even") and has("used") and (.xmode=="date")))' \
+  "$PDIR/pace.json" >/dev/null || fail "playback回帰: segs[\"7d\"] が無い or 必須キー欠落 or xmode!=date"
+segmax="$(jq -r '.playback.segs["5h"][0].used | map(.[1]) | max' "$PDIR/pace.json")"
+segb0="$(jq -r '.playback.segs["5h"][1].used[0][1]' "$PDIR/pace.json")"
+jq -e '(.playback.segs["5h"][0].used | map(.[1]) | max) >= 80' "$PDIR/pace.json" >/dev/null \
   || fail "playback回帰: 前窓が高値に達していない (max=$segmax, 期待>=80)"
-jq -e '.playback.seg5h[1].used[0][1] <= 20' "$PDIR/pace.json" >/dev/null \
+jq -e '.playback.segs["5h"][1].used[0][1] <= 20' "$PDIR/pace.json" >/dev/null \
   || fail "playback回帰: 現窓が低値から始まらない＝リセット未再現 (先頭=$segb0, 期待<=20)"
-ok "プレイバック(5h): seg5h=2窓・前窓ピーク($segmax)→現窓は低値開始($segb0)でリセット再現"
+ok "プレイバック(5h): segs[5h]=2窓・前窓ピーク($segmax)→現窓は低値開始($segb0)でリセット再現"
 
-# 5q) プレイバック回帰(7d): 直近7dに 7d 窓の境界をまたぐと seg7d が古い順に 2 セグメントになり、
+
+# 5q) プレイバック回帰(7d): 直近7dに 7d 窓の境界をまたぐと segs["7d"] が古い順に 2 セグメントになり、
 #     後段（現 7d 窓）が低値から始まる＝7d リセットが再現される。h5r は各行 ts より未来にして
 #     stale フィルタを通す（そうしないと window_series が全行を捨てる）。
 QDIR="$HOME/playback7d-test"
@@ -256,15 +600,58 @@ with open(sys.argv[1], "w") as f:
         f.write(json.dumps(r) + "\n")
 PY
 TOKEN_PACE_DIR="$QDIR" python3 "$TP_DIR/bin/pace-json.py" || fail "playback7d回帰: pace-json.py が非ゼロ終了"
-jq -e '.playback.seg7d | length == 2' "$QDIR/pace.json" >/dev/null \
-  || fail "playback7d回帰: seg7d が 2 窓でない (len=$(jq -r '.playback.seg7d|length' "$QDIR/pace.json"))"
-q7max="$(jq -r '.playback.seg7d[0].used | map(.[1]) | max' "$QDIR/pace.json")"
-q7b0="$(jq -r '.playback.seg7d[1].used[0][1]' "$QDIR/pace.json")"
-jq -e '(.playback.seg7d[0].used | map(.[1]) | max) >= 60' "$QDIR/pace.json" >/dev/null \
+jq -e '.playback.segs["7d"] | length == 2' "$QDIR/pace.json" >/dev/null \
+  || fail "playback7d回帰: segs[\"7d\"] が 2 窓でない (len=$(jq -r '.playback.segs["7d"]|length' "$QDIR/pace.json"))"
+q7max="$(jq -r '.playback.segs["7d"][0].used | map(.[1]) | max' "$QDIR/pace.json")"
+q7b0="$(jq -r '.playback.segs["7d"][1].used[0][1]' "$QDIR/pace.json")"
+jq -e '(.playback.segs["7d"][0].used | map(.[1]) | max) >= 60' "$QDIR/pace.json" >/dev/null \
   || fail "playback7d回帰: 前 7d 窓が高値に達していない (max=$q7max, 期待>=60)"
-jq -e '.playback.seg7d[1].used[0][1] <= 20' "$QDIR/pace.json" >/dev/null \
+jq -e '.playback.segs["7d"][1].used[0][1] <= 20' "$QDIR/pace.json" >/dev/null \
   || fail "playback7d回帰: 現 7d 窓が低値から始まらない＝リセット未再現 (先頭=$q7b0, 期待<=20)"
-ok "プレイバック(7d): seg7d=2窓・前窓ピーク($q7max)→現窓は低値開始($q7b0)で 7d リセット再現"
+ok "プレイバック(7d): segs[7d]=2窓・前窓ピーク($q7max)→現窓は低値開始($q7b0)で 7d リセット再現"
+# 5r) プレイバック(Codex): Codex の枠はサービス側で名目の窓長を待たずに打ち切られ、
+#     名目の [リセット−窓長, リセット] が重なる（実測: 記録にある 4 回の切り替わりはすべて
+#     名目の終わりまで 68〜163 時間を残して起きている）。重なりを作って、
+#       ・窓ごとにセグメントが並ぶ（キーはパネル名）
+#       ・使用率 0% の間に resets_at が滑っただけの 1 点の窓は落ちる
+#       ・前の窓の used が次の窓の開始で切り詰められる（収集経路が 2 つあるための遅れた読み）
+#     を検証する。
+CPDIR="$HOME/codex-playback-test"
+mkdir -p "$CPDIR"
+python3 - "$CPDIR" <<'PY'
+import json, os, sys, time
+now = int(time.time())
+d = sys.argv[1]
+D = 86400
+with open(os.path.join(d, "pace.jsonl"), "w") as f:      # 再生の開始位置を決めるために要る
+    for k in range(7):
+        f.write(json.dumps({"ts": now - 6 * D + k * D, "h5": 10, "h5r": now + 3600,
+                            "d7": 20, "d7r": now + 3 * D}) + "\n")
+rA, rB = now + 2 * D, now + 5 * D        # 窓A=[now-5d, now+2d] / 窓B=[now-2d, now+5d]（重なる）
+rows = []
+for k in range(6):                        # 窓A の観測: now-5d 〜 now-2d-2h、0→60%
+    rows.append({"ts": now - 5 * D + k * (D // 2), "u": k * 12, "w": 10080, "r": rA})
+for k in range(4):                        # 0% のまま resets_at が滑る＝1 点だけの見かけの窓
+    ts = now - 2 * D - 3600 + k * 300
+    rows.append({"ts": ts, "u": 0, "w": 10080, "r": ts + 7 * D})
+for k in range(8):                        # 窓B の観測: now-2d 〜 now、0→30%
+    rows.append({"ts": now - 2 * D + k * (D // 4), "u": k * 4, "w": 10080, "r": rB})
+rows.append({"ts": now - 2 * D + 120, "u": 60, "w": 10080, "r": rA})   # 窓B 開始後に届いた窓A の遅れた読み
+rows.sort(key=lambda r: r["ts"])
+with open(os.path.join(d, "codex.jsonl"), "w") as f:
+    for r in rows:
+        f.write(json.dumps(r) + "\n")
+PY
+TOKEN_PACE_DIR="$CPDIR" python3 "$TP_DIR/bin/pace-json.py" || fail "Codex再生: pace-json.py が非ゼロ終了"
+CS='.playback.segs["codex 7d"]'
+jq -e "$CS | length == 2" "$CPDIR/pace.json" >/dev/null   || fail "Codex再生: セグメントが 2 窓でない (len=$(jq -r "$CS|length" "$CPDIR/pace.json")。0% で滑る窓を落とせていない可能性)"
+jq -e "$CS | (.[0].x0 < .[1].x0) and (.[0].x1 > .[1].x0)" "$CPDIR/pace.json" >/dev/null   || fail "Codex再生: 名目の窓が重なる状況を作れていない（検証の前提が崩れている）"
+jq -e "$CS | (.[0].used | last | .[0]) < .[1].x0" "$CPDIR/pace.json" >/dev/null   || fail "Codex再生: 前の窓の used が次の窓の開始を越えて残っている（遅れた読みの切り詰め漏れ）"
+jq -e "$CS | all(has(\"x0\") and has(\"x1\") and has(\"even\") and has(\"used\") and (.xmode==\"date\") and (.key==\"codex 7d\"))" \
+  "$CPDIR/pace.json" >/dev/null || fail "Codex再生: セグメントに必須キー欠落 or xmode/key が違う"
+jq -e "$CS | ((.[0].used | map(.[1]) | max) >= 60) and (.[1].used[0][1] == 0)" "$CPDIR/pace.json" >/dev/null \
+  || fail "Codex再生: 前窓のピーク/現窓の低値開始が再現されていない"
+ok "プレイバック(Codex): 窓ごとにセグメント・0%で滑る窓を除外・次の窓の開始で切り詰め"
 
 # 5m) 月次クレジット枠パネル: credits.jsonl があれば 3 枚目 "1mo" が出る（100% = monthly_limit）。
 #     limit<=0 の行（枠が未割当のときに API が返す monthly_limit=0）は % を定義できないので除外。
@@ -660,6 +1047,200 @@ jq -e '(.panels[1].hist | map(.[1]) | max) == 90' "$VDIR/pace.json" >/dev/null \
   || fail "履歴異常回帰: 前の窓のピーク 90 が失われた"
 ok "履歴の異常除去: 後戻りする窓と h5r 欠落行を弾き、急上昇 0・窓の切替 1 回"
 
+# 5f) 予測の帯: 別ツール(claude-codex-router)が定期的に書く forecast.json を、側とリセット時刻で
+#     パネルに突き合わせる。届くのは標本そのもの（窓ごとに ts[] と paths[][]）で、分位の切り出しは
+#     こちら持ち。窓の名前は相手の都合で変わり得るが、同じ窓ならリセット時刻は一致する。
+#     予測が今に合っているかは「起点 u と今の used% の差」1 本で見る。外れても捨てず、
+#     fc.stale を立てて描き方（黄・薄く）で示す。消すと理由が伝わらないため。
+#     相手の出力仕様は変わり得るので、形が違う・ファイルが無いときに他の表示が変わらないことまで見る。
+FDIR="$HOME/forecast-test"
+mkdir -p "$FDIR"
+python3 - "$FDIR/pace.jsonl" <<'PY'
+import json, sys, time
+now = int(time.time())
+h5r, d7r = now + 3600, now + 6 * 86400
+with open(sys.argv[1], "w") as f:
+    for i in range(5):
+        f.write(json.dumps({"ts": now - 600 + i * 120, "h5": 10 + i, "h5r": h5r,
+                            "d7": 5 + i, "d7r": d7r}) + "\n")
+PY
+# $1=出力先 $2=予測を何秒前に出したことにするか $3=リセットのずれ秒 $4=起点 u のずれ(pt)
+gen_fc() {
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import json, sys, time
+now = int(time.time())
+age, drift, udrift = int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])
+NS, NP = 8, 20                                   # ステップ数 / 標本数
+def win(side, r, u):                             # u は pace.jsonl の末尾の used% に合わせる
+    ts = [now + (r - now) * (k + 1) / NS for k in range(NS)]
+    paths = [[u + udrift + i * 0.5 * (k + 1) for k in range(NS)] for i in range(NP)]
+    return {"side": side, "u": u + udrift, "r": r, "win": (r - now) / 60,
+            "step_s": (r - now) / NS, "ts": ts, "paths": paths}
+json.dump({"t": now - age, "n": NP, "windows": {
+    "claude-session":    win("claude", now + 3600 + drift, 14),
+    "claude-weekly_all": win("claude", now + 6 * 86400 + drift, 9)}}, open(sys.argv[1], "w"))
+PY
+}
+fc_run() {   # $1=FORECAST_JSON に渡す値 → pace.json を作り直す
+  FORECAST_JSON="$1" TOKEN_PACE_DIR="$FDIR" python3 "$TP_DIR/bin/pace-json.py" \
+    || fail "予測回帰: pace-json.py が非ゼロ終了 (FORECAST_JSON=$1)"
+}
+fc_has()   { jq -r '[.panels[] | has("fc")] | map(select(.)) | length' "$FDIR/pace.json"; }
+fc_stale() { jq -r "[.panels[] | select(has(\"fc\")) | .fc.stale] | map(select(.)) | length" "$FDIR/pace.json"; }
+
+gen_fc "$FDIR/forecast.json" 0 0 0
+fc_run "$FDIR/forecast.json"
+[ "$(fc_has)" = "2" ] || fail "予測回帰: 5h/7d の両方に fc が載っていない (載った枚数=$(fc_has))"
+[ "$(fc_stale)" = "0" ] || fail "予測回帰: 起点が合っているのに stale が立った"
+jq -e '.panels[0].fc.levels | length == 19' "$FDIR/pace.json" >/dev/null \
+  || fail "予測回帰: 分位の段階数がこちらの設定（19）になっていない"
+jq -e '.panels[0].fc.pts | length == 8 and all(.[]; length == 20)' "$FDIR/pace.json" >/dev/null \
+  || fail "予測回帰: pts が [ts, 分位 19 個] の形でない"
+jq -e '.panels[0].fc.pts | map(.[0]) | (. == (. | sort))' "$FDIR/pace.json" >/dev/null \
+  || fail "予測回帰: pts の時刻が昇順でない"
+jq -e '.panels[0].fc.pts[0] | .[1] <= .[10] and .[10] <= .[19]' "$FDIR/pace.json" >/dev/null \
+  || fail "予測回帰: 分位が昇順に並んでいない（切り出しの誤り）"
+jq -e '.panels[0].fc.p_full != null' "$FDIR/pace.json" >/dev/null \
+  || fail "予測回帰: p_full を標本から出せていない"
+u5base="$(jq -r '.panels[0].used_now' "$FDIR/pace.json")"
+
+# 規則は起点のずれ 1 本。経過時間では判定しない（以前は窓の長さの 5% で別に落としていた）。
+gen_fc "$FDIR/old.json" 86400 0 0
+fc_run "$FDIR/old.json"
+[ "$(fc_has)" = "2" ]   || fail "予測回帰: 1 日前でも起点が合っていれば使うはずが落ちた"
+[ "$(fc_stale)" = "0" ] || fail "予測回帰: 経過時間だけで stale を立てている"
+
+# 起点が離れたら捨てずに stale を立てる（描画側が黄・薄くする）
+gen_fc "$FDIR/udrift.json" 0 0 6
+fc_run "$FDIR/udrift.json"
+[ "$(fc_has)" = "2" ]   || fail "予測回帰: 起点がずれた予測を捨ててしまった（消すと理由が伝わらない）"
+[ "$(fc_stale)" = "2" ] || fail "予測回帰: 起点が 6pt ずれたのに stale が立たない"
+gen_fc "$FDIR/uok.json" 0 0 4
+fc_run "$FDIR/uok.json"
+[ "$(fc_stale)" = "0" ] || fail "予測回帰: 起点のずれ 4pt（許容内）で stale が立った"
+
+gen_fc "$FDIR/drift.json" 0 200 0      # リセットが許容 120 秒を超えてずれる＝別の窓
+fc_run "$FDIR/drift.json"
+[ "$(fc_has)" = "0" ] || fail "予測回帰: リセットが 200 秒ずれた窓を取り違えた"
+
+python3 - "$FDIR/ragged.json" <<'PY'
+import json, sys, time
+now = int(time.time())                     # 標本の長さが ts と合わない行は捨てる
+ts = [now + 3600 * (k + 1) / 8 for k in range(8)]
+paths = [[14.0] * 8, [14.0] * 5, [14.0] * 8]
+json.dump({"t": now, "n": 3, "windows": {"w": {
+    "side": "claude", "u": 14, "r": now + 3600, "ts": ts, "paths": paths}}}, open(sys.argv[1], "w"))
+PY
+fc_run "$FDIR/ragged.json"
+jq -e '.panels[0].fc.pts | length == 8' "$FDIR/pace.json" >/dev/null \
+  || fail "予測回帰: 長さの合わない標本で帯が壊れた"
+
+printf '{"windows": {' > "$FDIR/broken.json"   # 追記途中で切れたファイル
+fc_run "$FDIR/broken.json"
+[ "$(fc_has)" = "0" ] || fail "予測回帰: 壊れた JSON から fc を作ってしまった"
+
+printf '[1,2,3]' > "$FDIR/noobj.json"          # 形が違う（辞書でない）
+fc_run "$FDIR/noobj.json"
+[ "$(fc_has)" = "0" ] || fail "予測回帰: 辞書でない JSON から fc を作ってしまった"
+
+fc_run "$FDIR/does-not-exist.json"             # ファイルが無い＝相手が未導入
+[ "$(fc_has)" = "0" ] || fail "予測回帰: 存在しないファイルで fc が載った"
+jq -e '.panels | length == 2 and all(has("used"))' "$FDIR/pace.json" >/dev/null \
+  || fail "予測回帰: 予測が無いときに他のパネルが壊れた"
+jq -e --argjson u "$u5base" '.panels[0].used_now == $u' "$FDIR/pace.json" >/dev/null \
+  || fail "予測回帰: 予測の有無で used_now が変わった"
+ok "予測の帯: 標本から分位を切り出し・判定は起点のずれ 1 本・外れても捨てず stale・窓違い/壊れた形/無しは捨て、他は不変"
+
+# 5g) 予測の履歴(forecast-hist.bin): 再生中にも帯を出すため、15 分格子で追記して
+#     7 日ぶん持つ。形式は uint16 の時間方向差分。同じ格子では増えないこと、
+#     復元した値が pace.json の fc と一致すること、古いものが落ちることを見る。
+rm -f "$FDIR/forecast-hist.bin"
+gen_fc "$FDIR/forecast.json" 0 0 0
+fc_run "$FDIR/forecast.json"
+[ -f "$FDIR/forecast-hist.bin" ] || fail "予測の履歴: forecast-hist.bin が作られない"
+hsz1="$(wc -c < "$FDIR/forecast-hist.bin" | tr -d '[:space:]')"
+fc_run "$FDIR/forecast.json"
+hsz2="$(wc -c < "$FDIR/forecast-hist.bin" | tr -d '[:space:]')"
+[ "$hsz1" = "$hsz2" ] || fail "予測の履歴: 同じ 15 分格子で二重に追記された ($hsz1 -> $hsz2)"
+TP_BIN="$TP_DIR/bin/pace-json.py" python3 - "$FDIR" <<'PY' || fail "予測の履歴: 復元や切り詰めが不正"
+import importlib.util, json, os, struct, sys
+spec = importlib.util.spec_from_file_location("pacejson", os.environ["TP_BIN"])
+pj = importlib.util.module_from_spec(spec); spec.loader.exec_module(pj)
+fdir = sys.argv[1]
+pj.TP_DIR = fdir
+pj.FC_HIST_OUT = os.path.join(fdir, "forecast-hist.bin")
+d = json.load(open(os.path.join(fdir, "pace.json")))
+by_key = {p["key"]: p for p in d["panels"]}
+want = {p["key"] for p in d["panels"] if p.get("fc")}   # 予測が付いている枠はすべて書く
+panels = d["panels"]
+ok, recs = pj._fch_read(pj.FC_HIST_OUT)
+if not ok or len(recs) != len(want):
+    sys.exit("履歴を読み戻せない (ok=%s n=%d 期待=%d)" % (ok, len(recs), len(want)))
+head, buf = pj._fch_header(), open(pj.FC_HIST_OUT, "rb").read()
+L, i, seen = len(pj.FORECAST_LEVELS), len(head), set()
+while i < len(buf):
+    _slot, klen, tend, step, n, u = struct.unpack_from(pj.FC_HIST_HEAD, buf, i)
+    i += pj.FC_HIST_HEAD_SZ
+    key = buf[i:i + klen].decode("utf-8"); i += klen
+    seen.add(key)
+    if key not in by_key:
+        sys.exit("知らない枠のキー %r" % key)
+    vals = struct.unpack_from("<%dH" % (n * L), buf, i); i += 2 * n * L
+    src = by_key[key]["fc"]["pts"]
+    if n != len(src):
+        sys.exit("ステップ数が違う (%d != %d)" % (n, len(src)))
+    acc = [0] * L
+    for j in range(n):
+        tj = tend - (n - 1 - j) * step / 100.0
+        if abs(tj - src[j][0]) > 1.0:
+            sys.exit("時刻が復元できない (%.2f != %.2f)" % (tj, src[j][0]))
+        for k in range(L):
+            acc[k] += vals[j * L + k]
+            if abs(acc[k] / 10.0 - src[j][1 + k]) > 0.05:
+                sys.exit("値が復元できない (%.3f != %.3f)" % (acc[k] / 10.0, src[j][1 + k]))
+    if abs(u / 10.0 - (by_key[key]["used_now"] or 0)) > 0.05:
+        sys.exit("起点 u が違う")
+if seen != want:
+    sys.exit("予測が付いている枠が全部書かれていない (%s != %s)" % (sorted(seen), sorted(want)))
+# 7 日を越えた追記で古いレコードが落ちる
+pj.append_forecast_hist(panels, d["generated_at"] + pj.PLAYBACK_SPAN + pj.FC_HIST_SLOT)
+ok2, recs2 = pj._fch_read(pj.FC_HIST_OUT)
+if not ok2 or len(recs2) != len(want):
+    sys.exit("7 日より古いレコードが落ちていない (n=%d)" % len(recs2))
+# 分位の並びが変わったら読まずに作り直す
+pj.FORECAST_LEVELS = tuple(round(0.1 * k, 2) for k in range(1, 10))
+if pj._fch_read(pj.FC_HIST_OUT)[0]:
+    sys.exit("分位の並びが変わったファイルをそのまま読んだ")
+PY
+ok "予測の履歴: 予測が付いた枠をすべて 15 分格子で追記・二重なし・値と時刻が復元できる・7 日で切り詰め・分位変更で作り直し"
+
+# 5u) 使用量の取得: epoch のリセット時刻で書き、間引き中は何もしない(rc=2)
+UDIR="$HOME/udir"; mkdir -p "$UDIR"
+cat > "$UDIR/usage.json" <<'JSON'
+{"five_hour":{"utilization":18,"resets_at":"2030-01-01T00:00:00Z"},
+ "seven_day":{"utilization":7.5,"resets_at":"2030-01-02T00:00:00Z"}}
+JSON
+TOKEN_PACE_DIR="$UDIR" TOKEN_PACE_USAGE_URL="file://$UDIR/usage.json" \
+  python3 "$TP_DIR/bin/usage-fetch.py" || fail "usage-fetch.py が行を書かない"
+urow="$(tail -1 "$UDIR/pace.jsonl")"
+echo "$urow" | jq -e '.src=="api" and .h5==18 and .d7==7.5
+  and (.h5r|type)=="number" and .h5r==1893456000 and (.d7r|type)=="number"' >/dev/null \
+  || fail "usage-fetch.py の行が不正: $urow"
+set +e
+TOKEN_PACE_DIR="$UDIR" TOKEN_PACE_USAGE_URL="file://$UDIR/usage.json" \
+  python3 "$TP_DIR/bin/usage-fetch.py"; urc=$?
+set -e
+[ "$urc" = "2" ] || fail "間引き中の usage-fetch.py が rc=$urc（2 を期待）"
+# 取得できない場合は記録しない（代替手段は持たない）
+rm -f "$UDIR/.last_usage"            # 間引きを解いて取得そのものを試させる
+set +e
+TOKEN_PACE_DIR="$UDIR" TOKEN_PACE_USAGE_URL="file://$UDIR/no-such.json" \
+  python3 "$TP_DIR/bin/usage-fetch.py"; urc2=$?
+set -e
+[ "$urc2" = "1" ] && [ "$(tail -1 "$UDIR/pace.jsonl")" = "$urow" ] \
+  || fail "取得失敗時に rc=1 で何も書かないこと (rc=$urc2)"
+ok "使用量の取得: epoch のリセット時刻で記録・間引きで rc=2・取得失敗で rc=1（何も書かない）"
+
 # 6) serve.sh が / と /pace.json を配信
 bash "$TP_DIR/bin/serve.sh" >/dev/null || fail "serve.sh が非ゼロ終了"
 [ -r "$TP_DIR/.web_server" ] || fail ".web_server が記録されていない"
@@ -676,7 +1257,16 @@ pcode="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/pace.jso
 [ "$pcode" = "200" ] || fail "GET /pace.json が $pcode"
 curl -s "http://127.0.0.1:$PORT/pace.json" | jq -e '.panels | length == 2' >/dev/null \
   || fail "配信された /pace.json が不正"
-ok "serve.sh が / と /pace.json を配信 (port=$PORT pid=$SRV_PID)"
+# 再生用の予測の履歴も配信する（gzip を求められたら gzip で返す）
+cp "$FDIR/forecast-hist.bin" "$TP_DIR/forecast-hist.bin"
+fcode="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/forecast-hist.bin")"
+[ "$fcode" = "200" ] || fail "GET /forecast-hist.bin が $fcode"
+fenc="$(curl -s -o /dev/null -D - -H 'Accept-Encoding: gzip' "http://127.0.0.1:$PORT/forecast-hist.bin" \
+         | tr -d '\r' | awk -F': ' 'tolower($1)=="content-encoding"{print $2}')"
+[ "$fenc" = "gzip" ] || fail "forecast-hist.bin が gzip で返らない (Content-Encoding=$fenc)"
+fmagic="$(curl -s --compressed "http://127.0.0.1:$PORT/forecast-hist.bin" | head -c 4)"
+[ "$fmagic" = "TPFC" ] || fail "配信された forecast-hist.bin の中身が違う ($fmagic)"
+ok "serve.sh が / と /pace.json と /forecast-hist.bin（gzip）を配信 (port=$PORT pid=$SRV_PID)"
 
 # 6b) ハードニング: 記録ファイル/元 statusLine は配信しない（ホワイトリスト外は 404）
 for badpath in /pace.jsonl /.orig_statusline /config.json; do
@@ -686,22 +1276,27 @@ done
 # 6c) ハードニング: 別 Host（DNS リバインド）は 403 で拒否
 hc="$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example' "http://127.0.0.1:$PORT/pace.json")"
 [ "$hc" = "403" ] || fail "異なる Host を拒否しない (HTTP $hc)"
-ok "配信は index.html/pace.json に限定・別 Host を拒否（DNS リバインド対策）"
+ok "配信はホワイトリストの 3 パスに限定・別 Host を拒否（DNS リバインド対策）"
 
 # 7) 冪等性: 2 回目の install はラッパーを二重化せず、元コマンドも上書きしない
 do_install || fail "2 回目のインストール($MODE) が失敗"
-[ "$(jq -r '.statusLine.command' "$SETTINGS")" = "$WRAPPER" ] || fail "冪等性: statusLine が変化した"
+[ "$(jq -r '.statusLine.command' "$SETTINGS")" = "$WRAPPER" ] \
+  || fail "冪等性: statusLine がラッパーを指していない"
 [ "$(cat "$TP_DIR/.orig_statusline")" = "echo ORIG-STATUSLINE-OK" ] \
-  || fail "冪等性: 元コマンドが上書きされた（転送ループの原因になる）"
-ok "install は冪等（二重ラップなし・元コマンド保持）"
+  || fail "冪等性: 元の statusLine がラッパー自身で上書きされた（ラッパーが自分を呼び続ける）"
+[ -x "$TP_DIR/bin/tick.sh" ] || fail "冪等性: tick.sh が消えた"
+ok "install は冪等（ラッパーを二重化せず・元の statusLine を保持）"
 
 # 8) uninstall が statusLine を復元しコマンド/サーバを片付ける
 bash "$TP_DIR/uninstall.sh" >/dev/null || fail "uninstall.sh が失敗"
 restored="$(jq -r '.statusLine.command' "$SETTINGS")"
-[ "$restored" = "echo ORIG-STATUSLINE-OK" ] || fail "uninstall が元 statusLine を復元しない (got: $restored)"
+[ "$restored" = "echo ORIG-STATUSLINE-OK" ] || fail "uninstall が statusLine を壊した (got: $restored)"
 [ ! -f "$HOME/.claude/commands/tpw.md" ] || fail "uninstall が /tpw を削除しない"
 if kill -0 "$SRV_PID" 2>/dev/null; then fail "uninstall がサーバを停止しない (pid $SRV_PID 生存)"; fi
 SRV_PID=""
-ok "uninstall: statusLine 復元・/tpw 削除・サーバ停止"
+ok "uninstall: /tpw 削除・サーバ停止・statusLine を元に戻す"
+
+verify_uid_resources || exit 1
+ok "実ユーザーの systemd timer・ユニットファイル・crontab は試験の前後で不変"
 
 echo "🎉 smoke test PASSED"

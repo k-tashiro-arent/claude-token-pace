@@ -45,8 +45,10 @@
  var ML=40, MR=8, MT=6, MB=18, MAX_TICKS=12;
  var data=null, lastGen=null, hover=[], theme="dark", panelCount=0;
  var alignMode=false;         // 全パネルを共通の時間軸（既定 直近1か月）に揃えるモード
- var pb=null;                 // プレイバック中の状態 {t:仮想now(epoch秒), seg5h:[…], seg7d:[…], raf:id}
- var PB_DURATION=6000;        // 早送り全体の所要(ms)
+ var pb=null;                 // プレイバック中の状態 {t:仮想now(epoch秒), segs:{キー:[…]}, raf:id}
+ var PB_DURATION=6000;        // 早送り全体の所要(ms)。Align 再生はこの長さのまま
+ var PB_SLOT=900;             // 再生カーソルを乗せる格子(秒)。pace-json.py の FC_HIST_SLOT と揃える
+ var PB_MS_PER_SLOT=1000/60;  // 1 格子を 1 コマで送る（7 日なら 672 コマ＝約 11 秒）
  function T(){ return THEMES[theme]||THEMES.dark; }
 
  function pad(n){ return (n<10?"0":"")+n; }
@@ -95,15 +97,18 @@
    }
    return out;
  }
- // 仮想 now=t で表示すべき 5h セグメントを選ぶ（窓内→そのまま / 窓を過ぎた→直近の過去窓 / 開始前→最古）
+ // 開始済みのうち最も新しい窓を選ぶ（セグメントは開始順）。
+ // Codex の枠はサービス側で名目の窓長を待たずに打ち切られ、名目の範囲が重なるため、
+ // 「カーソルを含む窓」で選ぶと古い窓が残る。5h/7d は窓が順に並ぶので結果は変わらない。
  function pbSegAt(segs, t){
    var chosen=null;
-   for(var i=0;i<segs.length;i++){
-     var s=segs[i];
-     if(t>=s.x0 && t<=s.x1) return s;
-     if(t>s.x1) chosen=s;
-   }
+   for(var i=0;i<segs.length;i++){ if(segs[i].x0<=t) chosen=segs[i]; }
    return chosen || segs[0];
+ }
+ function pbHasSegs(pbd){
+   if(!pbd || !pbd.segs) return false;
+   for(var k in pbd.segs){ if(pbd.segs[k] && pbd.segs[k].length) return true; }
+   return false;
  }
  // 縦補助線の目盛り（ローカル時刻境界。setHours/setDate で DST も吸収）
  function hourTicks(x0,x1){
@@ -127,6 +132,9 @@
  // pace(-100..0..+100)を色へ: -100=マイナス側端点 / 0=無彩色(灰) / +100=赤、中間は線形補間
  // マイナス側は Claude=青 / Codex=緑（どちらのツールの枠かを一目で分けるため）
  var NEUTRAL="rgb(142,142,142)";
+ var FAN_INK=0.16;            // 予測の帯を重ね切ったときの濃さ（分位の数によらず一定）
+ var FAN_STALE_INK=0.11;      // 起点が今の実績から離れた予測の濃さ（通常より薄くして古さを示す）
+ var FAN_STALE=[224,160,16];  // 同上の色（黄）。枠の色と変えて、今の状態に合っていないことを示す
  var UNDER_BLUE=[24,110,255], UNDER_GREEN=[22,175,95];
  function lerp(a,b,f){ return Math.round(a+(b-a)*f); }
  // パネルの key は pace-json.py の build_codex_panels が "codex " + 窓長 で作る
@@ -156,6 +164,54 @@
      g.addColorStop(f, colAt(i));
    }
    return g;
+ }
+// ---- 予測の履歴（再生中の帯）----
+ // forecast-hist.bin: 先頭 8+2L バイト（"TPFC"・版・分位の数 L・分位×1000）＋レコード列。
+ // 1 レコードは 18 バイトの見出し（格子時刻・キーの長さ・終端時刻・刻み×100・
+ // ステップ数・起点×10）、パネルのキー（UTF-8）、uint16 の本文（値×10 の時間方向差分）。
+ // 枠をこちらで固定せず、予測が付いているパネルをすべて書く。pace-json.py の _fch_record と対。
+ var fcHist=null, fcHistState=0, fcHistAt=0;   // 0=未取得 1=取得中 2=取得済 3=取れなかった
+ function parseFcHist(buf){
+   var dv=new DataView(buf), u8=new Uint8Array(buf), len=buf.byteLength, i;
+   if(len<8 || dv.getUint32(0,false)!==0x54504643) return null;   // "TPFC"
+   if(dv.getUint16(4,true)!==2) return null;                      // 版が違えば使わない
+   var L=dv.getUint16(6,true); if(!L || len<8+2*L) return null;
+   var levels=[]; for(i=0;i<L;i++) levels.push(dv.getUint16(8+2*i,true)/1000);
+   var map={}, off=8+2*L;
+   while(off+18<=len){
+     var klen=dv.getUint16(off+4,true), n=dv.getUint16(off+14,true);
+     var body=off+18+klen, end=body+2*n*L;
+     if(end>len) break;                                           // 途中で切れている
+     var key=""; for(i=0;i<klen;i++) key+=String.fromCharCode(u8[off+18+i]);   // キーは ASCII
+     map[key+"|"+dv.getUint32(off,true)]=
+       {tend:dv.getUint32(off+6,true), step:dv.getUint32(off+10,true)/100, n:n, off:body};
+     off=end;
+   }
+   return {dv:dv, L:L, levels:levels, map:map};
+ }
+ // 格子に乗ったカーソル時刻とパネルのキーに合う記録を、帯が使える形（ライブの fc と同じ）へ
+ function fcHistFind(key, t, x1){
+   var h=fcHist; if(!h || !key) return null;
+   var r=h.map[key+"|"+t]; if(!r) return null;
+   if(Math.abs(r.tend-x1)>120) return null;        // ライブと同じ窓の突き合わせ
+   var L=h.L, acc=[], pts=[], o=r.off, j, k;
+   for(k=0;k<L;k++) acc.push(0);
+   for(j=0;j<r.n;j++){
+     var row=[r.tend-(r.n-1-j)*r.step];
+     for(k=0;k<L;k++){ acc[k]+=h.dv.getUint16(o,true); o+=2; row.push(acc[k]/10); }
+     pts.push(row);
+   }
+   return {levels:h.levels, pts:pts, stale:false};  // カーソル＝予測の時刻なので起点はずれない
+ }
+
+ // 予測の中央値の系列 [[ts, 中央値], …]。帯を描いているときだけ返す（条件は帯の描画と同じ）
+ function fcMedian(p){
+   if(pb || alignMode) return null;
+   var fc=p && p.fc;
+   if(!fc || !fc.levels || !fc.pts || fc.pts.length<2) return null;
+   var mi=0, best=1e9;
+   for(var i=0;i<fc.levels.length;i++){ var d=Math.abs(fc.levels[i]-0.5); if(d<best){ best=d; mi=i; } }
+   return fc.pts.map(function(r){ return [r[0], r[1+mi]]; });
  }
 
  // 使用量が下がる箇所は空白として扱い、線もフィルもつながない（両モード共通）。
@@ -305,6 +361,30 @@
      ctx.fillText(xlab(t,p.xmode), lx, cssH-4);
    });
 
+   // 予測の帯: router が出した「リセットまでの使用率」の確率分布。外側の分位の対から順に
+   // 重ねるので、確率の高い内側ほど濃くなる（＝密度がそのまま濃さになる）。
+   // 1 層の濃さは分位の数から決める。層を重ねた中心の濃さが FAN_INK で一定になるので、
+   // 分位を細かくしても全体が黒くつぶれず、見た目の基準が変わらない。
+   // ライブ表示のときだけ出す（Align は履歴、再生は過去の仮想時刻なので、今の予測は当てはまらない）。
+   // ライブは pace.json の fc、再生中は forecast-hist.bin のカーソル時点の記録を使う。
+   var fan = pb ? (pb.align ? null : fcHistFind(p.key||"", pb.t, p.x1))
+                : (alignMode ? null : p.fc);
+   if(fan && fan.levels && fan.pts && fan.pts.length>1){
+     var fp=fan.pts, nband=fan.levels.length>>1;     // 分位の対の数（奇数個なら中央は帯にならない）
+     // 起点が今の実績から離れた予測は、消さずに黄色・薄くして描く（消すと理由が伝わらない）
+     var fu=fan.stale?FAN_STALE:underColor(p), fink=fan.stale?FAN_STALE_INK:FAN_INK;
+     var frgb=fu[0]+","+fu[1]+","+fu[2];
+     var fa=1-Math.pow(1-fink, 1/Math.max(nband,1));
+     ctx.fillStyle="rgba("+frgb+","+fa.toFixed(4)+")";
+     for(var bi=0;bi<nband;bi++){                    // 外側の対から内側の対へ
+       var lo=1+bi, hi=fan.levels.length-bi;         // pts の各行は [ts, 分位…]
+       ctx.beginPath();
+       fp.forEach(function(r,i){ var xx=X(r[0]), yy=Y(r[hi]); i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy); });
+       for(var k=fp.length-1;k>=0;k--) ctx.lineTo(X(fp[k][0]), Y(fp[k][lo]));
+       ctx.closePath(); ctx.fill();
+     }
+   }
+
    if(p.even && p.even.length){
      ctx.strokeStyle=T().label; ctx.globalAlpha=0.8; ctx.lineWidth=1.3; ctx.setLineDash([2,3]);
      splitRuns(p.even).map(function(run){ return clipRun(run, x0, x1); })
@@ -343,8 +423,12 @@
    }
 
    var tip=document.getElementById("t"+idx), ht=hover[idx];
-   if(!pb && ht!==null && ht>=x0 && ht<=x1 && p.used && p.used.length){
-     var np=nearest(p.used, ht);
+   // 実績の最後より右（＝予測の帯の上）では、予測の中央値を基準点にする。
+   // used も pace もその中央値から計算するので、表示の読み方は実績と変わらない。
+   var fcm=fcMedian(p), lastU=(p.used && p.used.length) ? p.used[p.used.length-1][0] : null;
+   var useFc=!!(fcm && ht!==null && (lastU===null || ht>lastU));
+   if(!pb && ht!==null && ht>=x0 && ht<=x1 && ((p.used && p.used.length) || useFc)){
+     var np=useFc ? nearest(fcm, ht) : nearest(p.used, ht);
      var ev=(np.length>2) ? np[2] : interp(p.even, np[0]);
      var hx=X(np[0]), hy=Y(np[1]);
      ctx.strokeStyle=T().hover; ctx.globalAlpha=0.5; ctx.lineWidth=1; ctx.setLineDash([2,2]);
@@ -375,15 +459,16 @@
    var pbd=j.playback;
    document.getElementById("play").disabled = alignMode
      ? !alignAvailable()
-     : !(pbd && ((pbd.seg5h&&pbd.seg5h.length)||(pbd.seg7d&&pbd.seg7d.length)));
+     : !pbHasSegs(pbd);
    applyAlignButton();
  }
 
  // ---- プレイバック（直近7d早送り。各パネルの窓リセットも再現） ----
  function pbActive(idx, t){             // 仮想now=t で表示するセグメント（無ければライブパネルへ縮退）
    if(pb.align) return data && data.panels[idx];   // Hist は軸固定。viewOf が履歴系列へ差し替える
-   var segs=(idx===0)?pb.seg5h:(idx===1?pb.seg7d:null);   // 月次パネルは再生対象外＝ライブのまま
-   return (segs && segs.length) ? pbSegAt(segs, t) : (data && data.panels[idx]);
+   var lp=data && data.panels[idx];                // セグメントはパネルのキーで引く（1mo は作らない→ライブのまま）
+   var segs=(lp && pb.segs) ? pb.segs[lp.key] : null;
+   return (segs && segs.length) ? pbSegAt(segs, t) : lp;
  }
  function pbHeader(idx, p, t){          // 再生カーソル t 時点の used/even を反映したヘッダ
    var pu=revealUsed(p.used, t);
@@ -394,6 +479,18 @@
  function startPlayback(){
    if(pb) return;
    var pbd=data && data.playback, start, end, align=alignMode && alignAvailable();
+   // 再生中の帯に使う予測の履歴は ▶ のときだけ取りに行く（普段のページは今までどおり）。
+   // 取れなくても帯が出ないだけで再生はできる。格子 1 つ分より古くなっていたら取り直す。
+   if(!align && (fcHistState===0 || (fcHistState>1 && Date.now()-fcHistAt>PB_SLOT*1000))){
+     fcHistState=1;
+     fetch("forecast-hist.bin", {cache:"no-store"})
+       .then(function(r){ return r.ok ? r.arrayBuffer() : null; })
+       .then(function(b){ fcHist = b ? parseFcHist(b) : null; })
+       .catch(function(){ fcHist=null; })
+       .then(function(){ fcHistState=fcHist?2:3; fcHistAt=Date.now(); startPlayback(); });
+     return;
+   }
+   if(fcHistState===1) return;                 // 取得中。終わったら自分で始まる
    var width=0, slide=false;
    if(align){
      // 表示幅（既定 30 日）の窓を、データの左端（既定 60 日前・記録が短ければ最古）から
@@ -405,19 +502,28 @@
      start=slide ? (lo+width) : data.hist_x0;
      end=data.hist_x1;
    } else {
-     var has5=pbd && pbd.seg5h && pbd.seg5h.length, has7=pbd && pbd.seg7d && pbd.seg7d.length;
-     if(!has5 && !has7) return;
+     if(!pbHasSegs(pbd)) return;
      start=pbd.start; end=Math.max(pbd.now, Date.now()/1000);
    }
    if(!(end>start)) return;
+   // 再生カーソルを予測の保存格子（15 分）に乗せる。帯の起点とカーソルが必ず一致し、
+   // 絵の数が画面のリフレッシュレートに左右されなくなる。Align 再生は履歴なので対象外。
+   var gs=0, nslot=0, dur=PB_DURATION;
+   if(!align){
+     gs=Math.ceil(start/PB_SLOT)*PB_SLOT;
+     nslot=Math.floor((end-gs)/PB_SLOT)+1;
+     if(nslot<1) nslot=0;                      // 格子が 1 つも入らない→これまでどおり連続で送る
+     else dur=Math.max(PB_DURATION, nslot*PB_MS_PER_SLOT);
+   }
    document.getElementById("play").disabled=true;
    document.getElementById("ts").textContent="▶ playback";
    pb={ t:start, align:align, width:width, slide:slide,
-        seg5h:(pbd&&pbd.seg5h)||[], seg7d:(pbd&&pbd.seg7d)||[], raf:0 };
+        segs:(pbd&&pbd.segs)||{}, raf:0 };
    var t0=performance.now();
    function frame(){
-     var f=(performance.now()-t0)/PB_DURATION; if(f>1) f=1;
-     pb.t=start+(end-start)*f;
+     var f=(performance.now()-t0)/dur; if(f>1) f=1;
+     pb.t = nslot ? (gs+Math.min(nslot-1, Math.floor(f*nslot))*PB_SLOT)
+                  : (start+(end-start)*f);
      for(var i=0;i<panelCount;i++){
        if(pb.align){
          setHeader(i, data.panels[i]);        // Hist のヘッダは枠の名前だけ
