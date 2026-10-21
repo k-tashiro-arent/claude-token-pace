@@ -121,7 +121,7 @@ if [[ "$CUR" == "$WRAPPER" ]]; then
   echo "  statusLine は既にラップ済み（変更なし）"
 elif [[ -n "$CUR" && "$CUR" == *"$TP_DIR"* ]]; then
   # このツールのファイルを包んで使っているなど、自動では差し替えられない形
-  echo "  注意: statusLine がこのツールのファイルを指しています（$CUR）。変更しません。" >&2
+  echo "  注意: statusLine がこのツールのファイルを指しています（${CUR}）。変更しません。" >&2
   echo "        statusLine からの記録と定期実行の点検を使うには、statusLine.command を $WRAPPER にしてください。" >&2
 else
   ts=$(date +%s 2>/dev/null || echo now)

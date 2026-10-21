@@ -215,7 +215,7 @@ check_systemd() {
     return
   fi
   if [[ ! -f $MASTER/$NAME.service || ! -f $MASTER/$NAME.timer ]]; then
-    problem "設置内容の控え（$MASTER）が無いため点検できません。install.sh を流し直してください"
+    problem "設置内容の控え（${MASTER}）が無いため点検できません。install.sh を流し直してください"
     return
   fi
   # 別の設置先のユニットなら触らない

@@ -27,7 +27,7 @@ if [[ -f "$SETTINGS" ]] && command -v jq >/dev/null 2>&1 \
     fi
     if [[ -s "$tmp" ]] && jq -e . "$tmp" >/dev/null 2>&1; then   # 空ファイルも jq empty は通るので -s と -e で見る
       mv "$tmp" "$SETTINGS"
-      echo "statusLine を元に戻しました（backup: $SETTINGS.tokenpace-bak.$ts）"
+      echo "statusLine を元に戻しました（backup: $SETTINGS.tokenpace-bak.${ts}）"
     else
       rm -f "$tmp"
       echo "statusLine 復元に失敗（JSON不正）。手動で確認してください。" >&2

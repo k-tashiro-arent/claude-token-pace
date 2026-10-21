@@ -92,9 +92,9 @@ fi
 # 1) レート枠（5h/7d）。間引きは usage-fetch.py 自身が .last_usage で行う
 out=$(python3 "$BIN_DIR/usage-fetch.py" 2>&1 9>&-); urc=$?
 case "$urc" in
-  0) log "usage 記録した（契機=$FROM）" ;;
+  0) log "usage 記録した（契機=${FROM}）" ;;
   2) # statusLine の契機は 1 分おきに来るので、間引いただけのときは書かない（ログが埋まる）
-     [[ $FROM == statusline ]] || log "usage 間引き中（前回から間がない、または 429 のバックオフ中。契機=$FROM）" ;;
+     [[ $FROM == statusline ]] || log "usage 間引き中（前回から間がない、または 429 のバックオフ中。契機=${FROM}）" ;;
   *) log "usage 取得できず rc=$urc 契機=$FROM ${out%%$'\n'*}" ;;
 esac
 

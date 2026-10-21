@@ -297,7 +297,7 @@ mutated() { grep -E 'systemctl --user (enable|disable|restart|start|stop|daemon-
 
 # 3s-1) systemd 経路
 stubenv bash "$REPO/install.sh" >/dev/null || fail "スタブ環境の install(systemd) が失敗"
-[ -f "$UNIT" ] && [ -f "$SVC" ] || fail "systemd のユニットが生成されない"
+if [ ! -f "$UNIT" ] || [ ! -f "$SVC" ]; then fail "systemd のユニットが生成されない"; fi
 grep -q '^OnUnitActiveSec=5min$' "$UNIT" || fail "timer の間隔が 5min でない: $(grep -c . "$UNIT") 行"
 ! grep -q '^Persistent=' "$UNIT" || fail "monotonic timer に効かない Persistent= が残っている"
 grep -q "^Environment=TOKEN_PACE_DIR=$TP_DIR\$" "$SVC" || fail "service に TOKEN_PACE_DIR が無い"
@@ -784,7 +784,7 @@ TOKEN_PACE_DIR="$XDIR" CODEX_HOME="$XHOME" python3 "$TP_DIR/bin/codex-scan.py" \
   || fail "codex回帰(増分): codex-scan.py が非ゼロ終了"
 xrows2="$(wc -l < "$XDIR/codex.jsonl" | tr -d '[:space:]')"
 [ "$xrows2" = "7" ] || fail "codex回帰(増分): 追記分のみ取り込めていない (got=$xrows2, 期待 7)"
-ok "Codex パネル: 7d/5h の 2 枚・ゆらぎ吸収・逆行を包絡・古い窓を除外・増分スキャン($xrows→$xrows2 行)・本文非混入"
+ok "Codex パネル: 7d/5h の 2 枚・ゆらぎ吸収・逆行を包絡・古い窓を除外・増分スキャン(${xrows}→$xrows2 行)・本文非混入"
 
 # 5y) 終了済みの窓はパネルにしない。Codex は 5h+7d → 7d へ枠構成が変わった実績があり、
 #     消えた枠の最後の観測をそのまま描くと現在の枠として誤読されるため。
@@ -1230,15 +1230,16 @@ set +e
 TOKEN_PACE_DIR="$UDIR" TOKEN_PACE_USAGE_URL="file://$UDIR/usage.json" \
   python3 "$TP_DIR/bin/usage-fetch.py"; urc=$?
 set -e
-[ "$urc" = "2" ] || fail "間引き中の usage-fetch.py が rc=$urc（2 を期待）"
+[ "$urc" = "2" ] || fail "間引き中の usage-fetch.py が rc=${urc}（2 を期待）"
 # 取得できない場合は記録しない（代替手段は持たない）
 rm -f "$UDIR/.last_usage"            # 間引きを解いて取得そのものを試させる
 set +e
 TOKEN_PACE_DIR="$UDIR" TOKEN_PACE_USAGE_URL="file://$UDIR/no-such.json" \
   python3 "$TP_DIR/bin/usage-fetch.py"; urc2=$?
 set -e
-[ "$urc2" = "1" ] && [ "$(tail -1 "$UDIR/pace.jsonl")" = "$urow" ] \
-  || fail "取得失敗時に rc=1 で何も書かないこと (rc=$urc2)"
+if [ "$urc2" != "1" ] || [ "$(tail -1 "$UDIR/pace.jsonl")" != "$urow" ]; then
+  fail "取得失敗時に rc=1 で何も書かないこと (rc=$urc2)"
+fi
 ok "使用量の取得: epoch のリセット時刻で記録・間引きで rc=2・取得失敗で rc=1（何も書かない）"
 
 # 6) serve.sh が / と /pace.json を配信
