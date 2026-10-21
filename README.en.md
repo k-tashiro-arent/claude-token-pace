@@ -186,7 +186,7 @@ Both paths run whenever a recording is triggered (at least 2 minutes apart). Whe
 
 ## Usage forecast (optional)
 
-**This appears only when the separate tool claude-codex-router is running on the same machine and writing forecasts.** Without it the band simply does not appear; nothing else changes.
+**This appears only when the separate tool [claude-codex-router](https://github.com/k-tashiro-arent/claude-codex-router) is running on the same machine and writing forecasts.** Without it the band simply does not appear; nothing else changes.
 
 How far usage is likely to climb before the reset is drawn as a probability band over the used line. **Darker areas are more likely**: the dark middle is the likely range, the pale outer edges are values that rarely happen.
 
