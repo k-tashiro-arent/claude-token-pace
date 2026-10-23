@@ -2,7 +2,8 @@
 # 記録の入口。契機は 2 つあり、どちらから呼ばれても同じ処理をする:
 #   tick.sh --from timer       systemd の timer / cron から（Claude Code を使っていなくても回る）
 #   tick.sh --from statusline  Claude Code の statusLine から（statusline-wrapper.sh が 1 分に 1 回まで蹴る）
-# どちらの契機でも、使用量は API から取得する（statusLine の JSON は記録に使わない）。
+# どちらの契機でも、使用量は API から取得する。statusLine の契機では、標準入力に来た
+# statusLine の JSON の rate_limits も記録する（API が 429 で休んでいる間も記録を途切れさせないため）。
 # 各処理は .last_* の印で間引くので、契機が重なっても取得の頻度は上がりすぎない。
 #
 # statusLine から呼ばれたときは、定期実行が設置したとおりに動いているかも点検し、
@@ -60,6 +61,14 @@ due() {
 # timer が動いている証拠として、timer からの起動時刻を残す（scheduler.sh check が見る）。
 # 下の排他で処理を飛ばしたときも timer 自体は動いているので、先に残す。
 [[ $FROM == timer ]] && printf '%s' "$_now" > "$TP_DIR/.last_timer_tick"
+
+# statusLine の値の記録も、下の排他で捨てられないよう先に行う（API の間引き・休止とは無関係）。
+# 端末から手で --from statusline を付けて起動したときは標準入力を待たない。
+if [[ $FROM == statusline && ! -t 0 ]]; then
+  out=$(python3 "$BIN_DIR/usage-fetch.py" --statusline 2>&1); slrc=$?
+  # 記録できた・rate_limits が無いは書かない（1 分おきに来るのでログが埋まる）
+  [[ $slrc -eq 1 ]] && log "statusLine の値を読めず rc=${slrc} ${out%%$'\n'*}"
+fi
 
 # 2 つの契機が重なったら、後から来た方は何もしない
 if command -v flock >/dev/null 2>&1; then

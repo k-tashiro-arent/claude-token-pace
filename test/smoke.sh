@@ -208,6 +208,31 @@ echo '{}' | bash "$WRAPPER" >/dev/null
 [ "$(cat "$TP_DIR/.last_statusline")" = "$stamp1" ] || fail "1 分以内の statusLine で再び tick を蹴った"
 ok "statusLine の契機: 元の出力を返し、tick.sh を蹴って API から記録・1 分以内は蹴らない"
 
+# 3r) statusLine の値の記録: API が 429 で休んでいる間も、statusLine の JSON の rate_limits を
+#     src=statusline の行として記録する（API の休止では埋まらない空白を埋めるため）
+rm -f "$TP_DIR/.last_statusline"
+printf '%s' "$((now_t + 900))" > "$TP_DIR/.usage_backoff"
+rows0="$(wc -l < "$TP_DIR/pace.jsonl" | tr -d '[:space:]')"
+sl_r5=$((now_t + 3600)); sl_r7=$((now_t + 86400))
+sl_json="{\"session_id\":\"smoke-sl\",\"cost\":{\"total_cost_usd\":1.5},\"rate_limits\":{\"five_hour\":{\"used_percentage\":42,\"resets_at\":$sl_r5},\"seven_day\":{\"used_percentage\":17,\"resets_at\":$sl_r7}}}"
+sl_out="$(printf '%s' "$sl_json" | bash "$WRAPPER")"
+[ "$sl_out" = "ORIG-STATUSLINE-OK" ] || fail "rate_limits 付きでラッパーが元の出力を返さない (got: $sl_out)"
+i=0
+until [ "$(wc -l < "$TP_DIR/pace.jsonl" | tr -d '[:space:]')" -gt "$rows0" ]; do
+  i=$((i + 1)); [ "$i" -le 30 ] || fail "API の休止中に statusLine の値が記録されない"
+  sleep 0.5
+done
+sleep 1                                          # tick.sh が API 側で余計な行を書かないことも見る
+rows1="$(wc -l < "$TP_DIR/pace.jsonl" | tr -d '[:space:]')"
+[ "$rows1" -eq $((rows0 + 1)) ] || fail "statusLine の値の記録が 1 行でない ($rows0 → $rows1)"
+tail -1 "$TP_DIR/pace.jsonl" | jq -e --argjson r5 "$sl_r5" --argjson r7 "$sl_r7" \
+  '.src=="statusline" and .h5==42 and .h5r==$r5 and .d7==17 and .d7r==$r7
+   and .sid=="smoke-sl" and .cost==1.5' >/dev/null \
+  || fail "statusLine の値の行が不正: $(tail -1 "$TP_DIR/pace.jsonl")"
+! grep -q 'statusLine の値を読めず' "$TP_DIR/tick.log" || fail "statusLine の値の記録が失敗として残った"
+rm -f "$TP_DIR/.usage_backoff"
+ok "statusLine の値の記録: API の休止中も rate_limits を src=statusline で 1 行記録"
+
 # 3k) macOS の Keychain 読み出し: security を差し替えて、ファイルが無くても認証情報を読めること、
 #     ファイルがあればそちらが優先されること、security が失敗したらトークン無しとして扱うことを見る
 KCDIR="$HOME/kc"; mkdir -p "$KCDIR/bin" "$KCDIR/empty" "$KCDIR/withfile"

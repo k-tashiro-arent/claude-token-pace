@@ -86,6 +86,7 @@ IVAL="$(cat "$TP_DIR/sched/interval" 2>/dev/null || echo 5)min"
 cat > "$WRAPPER" <<EOF
 #!/usr/bin/env bash
 # Installed by claude-token-pace. 元の statusLine の出力をそのまま通し、記録（tick.sh）を 1 分に 1 回まで蹴る。
+# tick.sh には statusLine の JSON を渡す（rate_limits を記録するため）。
 json=\$(cat)
 TP_DIR="$TP_DIR"
 export TOKEN_PACE_DIR="\$TP_DIR"
@@ -96,9 +97,9 @@ last=0
 if [[ \$now =~ ^[0-9]+\$ ]] && (( now - last >= 60 )); then
   printf '%s' "\$now" > "\$TP_DIR/.last_statusline" 2>/dev/null
   if command -v setsid >/dev/null 2>&1; then
-    setsid bash "\$TP_DIR/bin/tick.sh" --from statusline </dev/null >/dev/null 2>&1 &
+    setsid bash "\$TP_DIR/bin/tick.sh" --from statusline <<<"\$json" >/dev/null 2>&1 &
   else
-    nohup  bash "\$TP_DIR/bin/tick.sh" --from statusline </dev/null >/dev/null 2>&1 &
+    nohup  bash "\$TP_DIR/bin/tick.sh" --from statusline <<<"\$json" >/dev/null 2>&1 &
   fi
   disown 2>/dev/null || true
 fi

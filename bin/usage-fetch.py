@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Claude の 5h/7d レート枠を API から取得して pace.jsonl に 1 行追記する。
+"""Claude の 5h/7d レート枠を pace.jsonl に 1 行追記する。取り方は 2 つ:
 
-statusLine の JSON に載る rate_limits はセッションごとの持ち回りで、再開直後などに
-古いスナップショット（例: h5=0 / d7=100）がそのまま来ることがある。こちらは Claude Code
-自身が使うのと同じエンドポイント GET /api/oauth/usage から口座単位の現在値を取るので、
-セッションによるばらつきが無く、Claude Code が動いていない間も取得できる。
+- 既定      : API（Claude Code 自身が使うのと同じ GET /api/oauth/usage）から口座単位の現在値を取る。
+              セッションによるばらつきが無く、Claude Code が動いていない間も取得できる。
+- --statusline : 標準入力に来た statusLine の JSON の rate_limits を記録する（src:"statusline"）。
+              API が 429 で休んでいる間も Claude Code を使っていれば記録が途切れない。
+              API の間引き・429 の休止は見ない（API を叩かないため）。rate_limits は
+              セッションごとの持ち回りで、再開直後などに古いスナップショット（例: h5=0 / d7=100）が
+              来ることがある。記録は無加工で行い、古い行は pace-json.py の _stale が弾く。
 
 - 認証 : $CLAUDE_CONFIG_DIR(既定 ~/.claude)/.credentials.json の claudeAiOauth.accessToken
          （macOS はこのファイルが無く Keychain に入るので、security コマンドで読む）
          を読むだけ（credits-fetch.py と同じ。refresh は Claude Code 本体に任せる）。
-- 出力 : $TOKEN_PACE_DIR/pace.jsonl  {ts, h5, h5r, d7, d7r, cost, sid, src:"api"}
+- 出力 : $TOKEN_PACE_DIR/pace.jsonl  {ts, h5, h5r, d7, d7r, cost, sid, src:"api"|"statusline"}
          h5r/d7r は epoch 秒（pace-json.py の鮮度判定が数値を前提にするため）。
 - 間引き: $TOKEN_PACE_DIR/.last_usage で INTERVAL 秒に 1 回だけ取得する。短い間隔で叩くと
          API が 429(rate_limit_error) を返すため（実測: 30 秒間隔で発生）、定期実行の間隔と
          合わせて下限を設ける。429 を受けたら .usage_backoff まで取得を止める。
 - 終了 : 0=追記した / 2=間引き中で何もしない / 1=取得できなかった
+         --statusline のとき: 0=追記した / 2=rate_limits が無い（API 応答前など）/ 1=JSON を読めない
 
 環境変数（試験用）: TOKEN_PACE_USAGE_URL でエンドポイントを差し替えられる。
 """
@@ -183,12 +187,50 @@ def append_row(row):
             f.write(line)
 
 
+def _sl_window(rl, key):
+    """statusLine の rate_limits.five_hour / seven_day から (used%, reset epoch) を取り出す。"""
+    blk = rl.get(key) if isinstance(rl, dict) else None
+    if not isinstance(blk, dict):
+        return None, None
+    used = blk.get("used_percentage")
+    try:
+        used = round(float(used), 1)
+    except (ValueError, TypeError):
+        used = None
+    return used, _epoch(blk.get("resets_at"))
+
+
+def record_statusline(text, now):
+    """statusLine の JSON から 1 行追記する。終了コードは main と同じ規約。"""
+    if not text.strip():
+        return 2                      # 何も来ていない（0.4.1 以前のラッパーは </dev/null で蹴る）
+    try:
+        d = json.loads(text)
+    except ValueError:
+        return 1
+    if not isinstance(d, dict):
+        return 1
+    rl = d.get("rate_limits")
+    h5, h5r = _sl_window(rl, "five_hour")
+    d7, d7r = _sl_window(rl, "seven_day")
+    if h5 is None and d7 is None:
+        return 2                      # まだ rate_limits が載っていない（API 応答前など）
+    cost = d.get("cost")
+    cost = cost.get("total_cost_usd") if isinstance(cost, dict) else None
+    sid = d.get("session_id") or d.get("sessionId")
+    append_row({"ts": now, "h5": h5, "h5r": h5r, "d7": d7, "d7r": d7r,
+                "cost": cost, "sid": sid, "src": "statusline"})
+    return 0
+
+
 def main():
     now = int(datetime.now(timezone.utc).timestamp())
     try:
         os.makedirs(TP_DIR, exist_ok=True)
     except OSError:
         return 1
+    if sys.argv[1:] == ["--statusline"]:
+        return record_statusline(sys.stdin.read(), now)
     if backing_off(now) or throttled(now):
         return 2
     token = access_token()

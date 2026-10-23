@@ -31,7 +31,7 @@ smoke が通っても、実環境の定期実行が止まっていれば利用�
 
 ## コード規約 / Conventions
 - シェルは **shellcheck クリーン**、Python は **ruff クリーン**に保つ。
-- 使用量 API（`bin/usage-fetch.py`）から得たレート制限値は**無加工で記録**するのが原則。statusLine は記録のきっかけにだけ使い、statusLine に渡される値は記録しない（古いスナップショットが混ざるため）。
+- レート制限値は**無加工で記録**するのが原則。取り方は 2 つ: 使用量 API（`bin/usage-fetch.py`、`src:"api"`）と、statusLine に渡される値（`usage-fetch.py --statusline`、`src:"statusline"`。API が 429 で休む間の空白を埋めるため）。statusLine の値には古いスナップショットが混ざるので、記録では弾かず、`pace-json.py` の `_stale` / `mark_old_window` で除く。
 - 表示ロジック（`bin/pace-json.py`）を変えるときは、既存の回帰テスト（**窓内リセット** / **stale スナップショット除外**）を壊さないこと。挙動を変える場合は smoke にケースを追加する。
 - ユーザー設定（`config.json` / `biz-hours.json`）を壊さない・上書きしない（`install.sh` は冪等）。
 

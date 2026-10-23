@@ -134,7 +134,8 @@ Three buttons sit at the top right. The theme and `Align` choices are remembered
 ## Data collection & accumulation
 
 - The 5h/7d percentages come from **the same endpoint Claude Code itself uses**, `GET https://api.anthropic.com/api/oauth/usage`. When it cannot be fetched (no token, expired, no network), nothing is recorded for that round and it is retried on the next one.
-- **Recording has two triggers**: the periodic job and Claude Code showing its status line (intervals in the table below). Both fetch from the same API (the values passed to the statusLine are not recorded). Because of the periodic job, recording **keeps going whether or not Claude Code is running** — including the stretch where your quota recovers while you are away. No daemon is kept running (`/tpw` only starts the HTTP server that serves the page).
+- **Recording has two triggers**: the periodic job and Claude Code showing its status line (intervals in the table below). Both fetch from the same API. Because of the periodic job, recording **keeps going whether or not Claude Code is running** — including the stretch where your quota recovers while you are away. No daemon is kept running (`/tpw` only starts the HTTP server that serves the page).
+- **When the status line is shown, the usage values passed to it are recorded too.** So while the API is pausing after a `429`, recording continues as long as you use Claude Code. These values can be stale (for example right after resuming a session), so stale values are left out when the graph is built.
 - **When the status line is shown, it also checks that the periodic job has not stopped**, and restarts it if it has. The result is written to `tick.log`.
 - **With neither systemd nor cron available, recording happens only while you use Claude Code** — run `~/.claude/token-pace/bin/tick.sh` from any scheduler every few minutes to keep recording while you are away.
 - **Intervals at a glance.** When a trigger arrives before a task's minimum interval has passed, that task is skipped.
@@ -142,7 +143,7 @@ Three buttons sit at the top right. The theme and `Align` choices are remembered
   | What | Interval |
   |---|---|
   | Periodic job (trigger) | every 5 minutes by default (change in minutes with `TOKEN_PACE_INTERVAL`) |
-  | Status line shown (trigger) | at most once a minute |
+  | Status line shown (trigger, usage recording) | at most once a minute |
   | Checking / repairing the periodic job | at most once every 10 minutes (when the status line is shown) |
   | Usage (5h/7d) fetch | **at most once every 4 minutes** (pauses 15 minutes after a `429`) |
   | Codex fetch | at most once every 2 minutes |
@@ -150,7 +151,7 @@ Three buttons sit at the top right. The theme and `Align` choices are remembered
   | Monthly quota fetch | at most once every 5 minutes |
 
   The usage fetch has a floor because polling faster makes the API answer `429` (measured at a 30-second interval).
-- The 5h/7d quotas are **per account (user), not per session**, and so is the value the API returns. **Running any number of concurrent Claude Code sessions changes neither what is recorded nor how often** — and no two sessions can disagree about the number.
+- The 5h/7d quotas are **per account (user), not per session**, and so is the value the API returns. **Running any number of concurrent Claude Code sessions does not change how often it records** (the status-line trigger is at most once a minute across all sessions).
 - Data accumulates **locally, per installed environment**. History is not shared across machines — each environment builds its own. Right after install there is no history, so the panels (especially the 7-day one) fill in as you keep using Claude Code.
 
 ## Monthly usage credits (extra usage, optional)

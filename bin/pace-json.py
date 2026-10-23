@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """pace.jsonl -> pace.json（ブラウザ用の処理済み系列）。標準ライブラリのみ・matplotlib/PNG 不要。
 
-- 入力 : $TOKEN_PACE_DIR/pace.jsonl     (1行1サンプル。usage-fetch.py が append)
+- 入力 : $TOKEN_PACE_DIR/pace.jsonl     (1行1サンプル。usage-fetch.py が API と statusLine の値を append)
          $TOKEN_PACE_DIR/credits.jsonl (月次クレジット枠。credits-fetch.py が append。任意)
 - 出力 : $TOKEN_PACE_DIR/pace.json   (tmp -> os.replace でアトミック更新)
 - 設定 : $TOKEN_PACE_DIR/biz-hours.json  (標準ペースの基準。無い/不正なら既定 月-金 9-18)
