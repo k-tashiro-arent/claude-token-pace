@@ -2,7 +2,7 @@
 
 Claude Code の**使用率**（5時間枠・7日枠などのレート制限）を、ブラウザのグラフで見るツールです。**標準ペースとの差**を色と数値で示すので、「このペースで枠を使い切ってしまわないか」が一目で分かります。**ローカルだけで動き、集めた使用量データは手元から出ません。**
 
-*日本語 | [English](README.en.md)* ・ バージョン **0.4.1**（SemVer）
+*日本語 | [English](README.en.md)* ・ バージョン **0.5.0**（SemVer）
 
 [![CI](https://github.com/k-tashiro-arent/claude-token-pace/actions/workflows/ci.yml/badge.svg)](https://github.com/k-tashiro-arent/claude-token-pace/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/k-tashiro-arent/claude-token-pace)](https://github.com/k-tashiro-arent/claude-token-pace/releases)
