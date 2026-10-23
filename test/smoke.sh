@@ -1129,6 +1129,14 @@ jq -e '.panels[0].fc.p_full != null' "$FDIR/pace.json" >/dev/null \
   || fail "予測回帰: p_full を標本から出せていない"
 u5base="$(jq -r '.panels[0].used_now' "$FDIR/pace.json")"
 
+# 既定の読み込み先は router の既定の置き場（~/.claude-codex-router/data/forecast.json）
+mkdir -p "$HOME/.claude-codex-router/data"
+cp "$FDIR/forecast.json" "$HOME/.claude-codex-router/data/forecast.json"
+env -u FORECAST_JSON -u CLAUDE_CODEX_ROUTER_DIR TOKEN_PACE_DIR="$FDIR" \
+  python3 "$TP_DIR/bin/pace-json.py" || fail "予測回帰: 既定の読み込み先で pace-json.py が非ゼロ終了"
+[ "$(fc_has)" = "2" ] || fail "予測回帰: 既定の読み込み先 ~/.claude-codex-router の予測を読まない (載った枚数=$(fc_has))"
+rm -rf "$HOME/.claude-codex-router"
+
 # 規則は起点のずれ 1 本。経過時間では判定しない（以前は窓の長さの 5% で別に落としていた）。
 gen_fc "$FDIR/old.json" 86400 0 0
 fc_run "$FDIR/old.json"

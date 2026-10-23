@@ -54,10 +54,11 @@ RESET_TOL = 60
 
 # 予測（使用率の確率分布）の取り込み。別ツール claude-codex-router が窓ごとの分位を書く。
 # 置き場所は router 自身のデータディレクトリ（各ツールは自分のディレクトリにだけ書く）。
+# router の既定の置き場は ~/.claude-codex-router（以前は ~/.claude/codex-router）。
 # FORECAST_JSON で明示指定もできる。ファイルが無ければ帯を出さないだけで、他の表示は変わらない。
 FORECAST_JSON = os.path.expanduser(
     os.environ.get("FORECAST_JSON")
-    or os.path.join(os.environ.get("CLAUDE_CODEX_ROUTER_DIR") or "~/.claude/codex-router",
+    or os.path.join(os.environ.get("CLAUDE_CODEX_ROUTER_DIR") or "~/.claude-codex-router",
                     "data", "forecast.json"))
 FORECAST_RESET_TOL = 120   # 予測の窓とパネルを突き合わせる許容差（秒。実測の差は 0〜3 秒）
 # 予測は標本そのもの（窓ごとに ts[] と paths[][]）で届く。描く分位はこちらで切り出す。
